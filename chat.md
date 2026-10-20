@@ -6,3 +6,10 @@
 - **Built:** online.js (createLocal/createOnline), firestore.rules + sweep indexes (deployed), High Card demo, README for game builders, tests.
 - **Verified:** `cd test && npm test`: local 5, rules 71, online.js end-to-end 13, all green. The rules suite fails on open rules (40) and on subtly broken rules (3). `node test/real-smoke.mjs` passes on the real project. `node test/two-browsers.mjs https://timothyhadfield.github.io/game-online/demo/ --engine webkit` passes on LIVE (join by code, hidden hands, reload resume, game over, no console errors). Chromium passes too. Live at 52277c0+.
 - **Open:** real-iPhone host takeover timing; quota use at scale. See progress.md NOT verified.
+
+## 2026-10-20 — seat takeover security fix
+- **Asked (manager, from Skull King QA):** mid-game, anyone joining with an away player's NAME got that player's seat and hand. Bind rejoin to the uid; a different uid needs host approval or an open seat; default deny with "That seat belongs to someone else, ask the host."
+- **Decided:** same uid walks straight back in (unchanged). Different uid + seated name → host gets a `seatRequest` (built-in Allow/Deny card if the game doesn't listen). `setSeat(i, "open")` mid-game offers a seat up. No rules change needed: only the host can write seats/uids (now rules-tested). Joiner waits up to 2 min for an answer.
+- **Built:** online.js (seat requests, built-in card, open seats, `allowSeat`/`denySeat`, snapshot `seatRequests`/`askingHost`/`seats[].open`, joiner checks the server before reporting "no seat"), 6 new e2e steps, 7 new rules checks, `test/seat-takeover-browsers.mjs`, README Changelog (games must re-copy online.js).
+- **Verified:** fail-first: the new e2e step failed on the old online.js ("carl took alice's seat by typing her name"), passes on the fix. Loosened rules make the rules suite fail (10). Browser takeover test passes WebKit 393 px and Chromium 1280 px; two-browsers.mjs passes.
+- **Open:** emulator Listen-stream corruption under memory pressure makes e2e runs flaky (also on the old code). See Traps.

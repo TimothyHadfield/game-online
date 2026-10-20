@@ -187,6 +187,73 @@ ok("host close() deletes the room and every sub-document");
   await H.o.close();
 }
 
+// 8. seat takeover by name: rejoin is bound to the login (uid), not the typed name
+{
+  const H = client("tk-host"), A2 = client("tk-alice"), C2 = client("tk-carl"), E2 = client("tk-erin");
+  const m = await H.o.createRoom({ name: "Hana", seats: ["human", "empty", "computer"], options: { handSize: 4 } });
+  const R = "games/high-card/rooms/" + m.code;
+  assert.equal((await A2.o.joinRoom(m.code, "Alice")).ok, true);
+  await until(() => H.snap.seats[1].kind === "human", "alice seated");
+  await H.o.start();
+  await until(() => A2.snap && A2.snap.status === "playing" && A2.snap.mine, "alice playing");
+  const aUid = A2.o.uid, cUid = (await C2.o.ready());
+  const seatUid = async (i) => { let u; await env.withSecurityRulesDisabled(async (ctx) => { u = (await fsMod.getDoc(fsMod.doc(ctx.firestore(), R))).data().seatUids[i]; }); return u; };
+  const goAway = async (c, uid) => {
+    await c.o._detach();
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await fsMod.setDoc(fsMod.doc(ctx.firestore(), R + "/presence/" + uid), { at: fsMod.Timestamp.fromMillis(Date.now() - 120e3), expireAt: fsMod.Timestamp.fromMillis(Date.now() + 864e5) });
+    });
+    await until(() => H.snap.seats[1].online === false, "host sees alice offline");
+  };
+  const asks = [];
+  let answer = "deny";
+  H.o.on("seatRequest", (rq) => { asks.push(rq); setTimeout(() => (answer === "allow" ? rq.allow() : rq.deny()), 200); });
+
+  // alice goes away; carl types her name → must NOT get her seat
+  await goAway(A2, aUid);
+  const steal = await C2.o.joinRoom(m.code, "Alice");
+  assert.equal(steal.ok, false, "carl took alice's seat by typing her name");
+  assert.match(steal.message, /belongs to someone else/);
+  assert.equal(await seatUid(1), aUid);
+  assert.equal(asks.length, 1, "host was asked once");
+  assert.equal(asks[0].seat, 1);
+  ok("carl types away-alice's name → refused (host said no): " + steal.message);
+
+  // alice's own browser (same uid) comes back → her seat, no question asked
+  const back = await A2.o.joinRoom(m.code, "Alice");
+  assert.equal(back.ok, true, back.message);
+  assert.equal(back.seat, 1);
+  await until(() => A2.snap && A2.snap.mine && A2.snap.mine.hand.length > 0, "alice has her hand back");
+  assert.equal(asks.length, 1, "no request for a returning uid");
+  ok("alice's same login rejoins → gets seat 1 and her hand back without asking");
+
+  // alice away again; carl asks and the host ALLOWS → carl gets the seat
+  await goAway(A2, aUid);
+  answer = "allow";
+  const granted = await C2.o.joinRoom(m.code, "Alice");
+  assert.equal(granted.ok, true, granted.message);
+  assert.equal(granted.seat, 1);
+  assert.equal(await seatUid(1), cUid);
+  await until(() => C2.snap && C2.snap.mine && C2.snap.mine.hand.length > 0, "carl has the hand");
+  ok("host allows → carl gets alice's seat and its hand");
+  // alice's old login is out now
+  const late = await A2.o.joinRoom(m.code, "Alice");
+  assert.equal(late.ok, false);
+  ok("alice's old login can no longer walk back in while carl holds the seat (" + late.message + ")");
+
+  // host offers the computer seat up → erin joins under any name, no question
+  const before = asks.length;
+  assert.equal((await H.o.setSeat(2, "open")).ok, true);
+  await until(() => H.snap.seats[2].open === true, "seat 2 open");
+  const ej = await E2.o.joinRoom(m.code, "Erin");
+  assert.equal(ej.ok, true, ej.message);
+  assert.equal(ej.seat, 2);
+  assert.equal(asks.length, before, "open seat needs no approval");
+  await until(() => H.snap.seats[2].kind === "human" && H.snap.seats[2].name === "Erin" && !H.snap.seats[2].open, "erin in seat 2");
+  ok("host marks the computer seat open → erin takes it without a prompt");
+  await H.o.close();
+}
+
 console.log(`\nonline: ${pass} passed. Totals: ${counts.writes} writes, ${counts.deletes} deletes, ${counts.reads} reads.`);
 assert.deepEqual(A.errors.filter((e) => !/permission/i.test(e)), [], "alice errors");
 await env.cleanup();

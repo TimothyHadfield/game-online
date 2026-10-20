@@ -82,6 +82,17 @@ const move = (by, seat, extra = {}) => Object.assign({ by, seat, a: { card: 5 },
   await check("bob CANNOT change the room", assertFails(updateDoc(doc(as("bob"), R), { toAct: [0, 1, 2] })));
   await check("bob CANNOT take the host while alice is alive", assertFails(updateDoc(doc(as("bob"), R), { hostUid: "bob" })));
   await check("carol CANNOT seat herself", assertFails(updateDoc(doc(as("carol"), R), { uids: ["alice", "bob", "carol"] })));
+  // Seat takeover: only the host may change who sits where.
+  const steal = (who) => ({ seatUids: ["alice", who, ""], uids: ["alice", who], seats: [{ kind: "human", name: "Alice", uid: "alice" }, { kind: "human", name: "Bob", uid: who }, { kind: "computer", name: "C", uid: "" }] });
+  await check("carol CANNOT write herself into bob's seat (seatUids/uids/seats)", assertFails(updateDoc(doc(as("carol"), R), steal("carol"))));
+  await check("carol CANNOT write only seatUids", assertFails(updateDoc(doc(as("carol"), R), { seatUids: ["alice", "carol", ""] })));
+  await check("bob (member) CANNOT hand his seat to carol", assertFails(updateDoc(doc(as("bob"), R), steal("carol"))));
+  await check("carol CANNOT write herself a hand", assertFails(setDoc(doc(as("carol"), R + "/hands/carol"), { json: "[1]", v: 9, expireAt: soon() })));
+  await check("carol CANNOT forge a join note as bob", assertFails(setDoc(doc(as("carol"), R + "/joins/bob"), { name: "Bob", leave: true, at: serverTimestamp(), expireAt: soon() })));
+  await check("host CAN reseat bob's seat to carol (approved takeover)", assertSucceeds(updateDoc(doc(as("alice"), R), Object.assign(steal("carol"), { expireAt: soon() }))));
+  await seed({}, Timestamp.fromMillis(Date.now() - 120e3));
+  await check("stale host: carol CANNOT seat herself either", assertFails(updateDoc(doc(as("carol"), R), steal("carol"))));
+  await seed();
   await check("host updates the room", assertSucceeds(updateDoc(doc(as("alice"), R), { toAct: [0], v: 4, expireAt: soon() })));
   await check("host CANNOT hand hosting to a non-member", assertFails(updateDoc(doc(as("alice"), R), { hostUid: "carol" })));
   await check("host CANNOT set a far-future expiry", assertFails(updateDoc(doc(as("alice"), R), { expireAt: Timestamp.fromMillis(Date.now() + 10 * 864e5) })));

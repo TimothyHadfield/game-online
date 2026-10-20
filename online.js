@@ -23,7 +23,13 @@
  *   actions/{id}        moves from non-host players — host reads + deletes
  *   presence/{uid}      heartbeat, so a closed tab / lost host is noticed
  *   joins/{uid}         "let me in" / "I'm leaving" notes for the host
- * Every doc carries expireAt; a TTL policy deletes abandoned rooms for free.
+ * Every doc carries expireAt; clients sweep expired docs (TTL needs billing).
+ *
+ * SEATS BELONG TO A LOGIN, NOT A NAME. Mid-game, the same browser (same
+ * anonymous uid) gets its own seat back at once. A different login that types
+ * a seated player's name only gets that seat if the host says Allow (event
+ * "seatRequest", or a small built-in prompt if the game doesn't listen), or
+ * if the host has marked the seat open (setSeat(i, "open")).
  * ==========================================================================*/
 
 export const FIREBASE_CONFIG = {
@@ -52,6 +58,7 @@ function emitter() {
   return {
     on(ev, fn) { (fns[ev] = fns[ev] || []).push(fn); return () => { fns[ev] = fns[ev].filter((f) => f !== fn); }; },
     emit(ev, x) { for (const f of fns[ev] || []) { try { f(x); } catch (e) { console.error(e); } } },
+    count(ev) { return (fns[ev] || []).length; },
   };
 }
 const clone = (x) => (x === undefined ? undefined : JSON.parse(JSON.stringify(x)));
@@ -162,7 +169,8 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
   let db = null, auth = null;
   let me = null;           // my uid
   let code = null, room = null, mine = null, myHandV = -1;
-  let joinPending = false;
+  let joinPending = false, askingHost = false;
+  let requests = [];       // host: [{uid, name, seat, seatName}] waiting for Allow / Deny
   let subs = [];
   let hostSubs = [];
   let actingHost = false, hostState = null, lastHand = {};
@@ -210,18 +218,20 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
 
   // ------------------------------------------------------------ snapshot
   function snapshot() {
-    if (!room) return { mode: "online", status: joinPending ? "joining" : "none", code, error: lastError };
     const seat = mySeat();
+    if (!room || (joinPending && seat < 0)) return { mode: "online", status: joinPending ? "joining" : "none", code, askingHost, error: lastError };
     let pub = null;
     try { pub = JSON.parse(room.pubJson || "null"); } catch (e) {}
     const toAct = room.toAct || [];
+    const isHost = room.hostUid === me;
     return {
       mode: "online", code, status: room.status,
-      seats: room.seats.map((s) => ({ kind: s.kind, name: s.name, online: s.kind !== "human" || isOnline(s.uid), isHost: s.uid === room.hostUid && !!s.uid })),
-      mySeat: seat, isHost: room.hostUid === me,
+      seats: room.seats.map((s) => ({ kind: s.kind, name: s.name, online: s.kind !== "human" || isOnline(s.uid), isHost: s.uid === room.hostUid && !!s.uid, open: !!s.open })),
+      mySeat: seat, isHost,
       hostAway: room.hostUid !== me && !isOnline(room.hostUid),
       options: room.options || {},
       pub, mine, toAct, myTurn: seat >= 0 && toAct.includes(seat),
+      seatRequests: isHost ? requests.map(({ uid, name, seat: s, seatName }) => ({ uid, name, seat: s, seatName })) : [],
       v: room.v, error: lastError,
     };
   }
@@ -295,27 +305,59 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     const r = snap.data();
     code = c;
     if (r.uids.includes(me)) { await attach(c); return { ok: true, code: c, seat: r.seatUids.indexOf(me) }; }
+    const nm = cleanName(name);
+    // Mid-game a new login can only take a seat the host has marked open, or a
+    // named seat the host approves. A returning login was let in above.
+    const named = r.status === "lobby" ? null : r.seats.find((s) => s.kind === "human" && s.name === nm);
     const hasRoom = r.status === "lobby"
       ? r.seats.some((s) => s.kind === "empty")
-      : r.seats.some((s) => s.kind === "human" && s.name === cleanName(name));
+      : !!named || r.seats.some((s) => s.kind === "computer" && s.open);
     if (!hasRoom) { code = null; return fail(new Error(r.status === "lobby" ? "That room is full." : "That game has already started.")); }
+    const needsOk = !!(named && named.uid && !named.open);
+    const TAKEN = "That seat belongs to someone else, ask the host.";
     try {
-      await F.setDoc(P.join(me), { name: cleanName(name), leave: false, at: F.serverTimestamp(), expireAt: expireAt() });
+      await F.setDoc(P.join(me), { name: nm, leave: false, at: F.serverTimestamp(), expireAt: expireAt() });
     } catch (e) { code = null; return fail(e); }
     joinPending = true;
+    askingHost = needsOk;
     await attach(c);
     // Wait for the host to seat us (or turn us away by deleting the note).
     return await new Promise((resolve) => {
       let seenNote = false;
-      const t = setTimeout(() => { off(); unsubNote(); resolve(fail(new Error("The host didn't answer. Are they still there?"))); }, 20000);
+      let over = false;
+      const stop = () => { over = true; clearTimeout(t); clearInterval(poll); off(); unsubNote(); joinPending = false; askingHost = false; };
+      // Belt and braces while the host decides: if the note-deleted event is
+      // ever missed, notice the answer anyway (1 read per 5 s, only while asking).
+      const NO = needsOk ? TAKEN : "No free seat in that room.";
+      const poll = needsOk ? setInterval(() => {
+        F.getDoc(P.join(me)).then((d) => { if (!d.exists() && seenNote) noteGone(); }).catch(() => {});
+      }, 5000) : null;
+      const refuse = async (msg) => { if (over) return; stop(); await detach(); resolve(fail(new Error(msg))); };
+      // The host deletes the note once it has decided. Ask the server whether
+      // we were seated (the room listener can lag on a slow device), then say no.
+      let checking = false;
+      const noteGone = () => {
+        if (over || checking || mySeat() >= 0) return;
+        checking = true;
+        setTimeout(() => {
+          F.getDoc(P.room(c)).then((r) => {
+            checking = false;
+            if (over || mySeat() >= 0) return;
+            if (r.exists() && (r.data().seatUids || []).includes(me)) return;   // seated; the listener will catch up
+            refuse(NO);
+          }).catch(() => { checking = false; if (mySeat() < 0) refuse(NO); });
+        }, 1000);
+      };
+      const t = setTimeout(() => {
+        F.deleteDoc(P.join(me)).catch(() => {});
+        refuse(needsOk ? "The host didn't answer. " + TAKEN : "The host didn't answer. Are they still there?");
+      }, needsOk ? 120000 : 20000);
       const off = ev.on("change", (s) => {
-        if (s.mySeat >= 0) { clearTimeout(t); off(); unsubNote(); joinPending = false; resolve({ ok: true, code: c, seat: s.mySeat }); }
+        if (!over && s.mySeat >= 0) { stop(); resolve({ ok: true, code: c, seat: s.mySeat }); }
       });
       const unsubNote = F.onSnapshot(P.join(me), (d) => {
         if (d.exists()) { seenNote = true; return; }
-        if (seenNote && mySeat() < 0) {
-          setTimeout(() => { if (mySeat() < 0) { clearTimeout(t); off(); unsubNote(); joinPending = false; detach(); resolve(fail(new Error("No free seat in that room."))); } }, 1500);
-        }
+        if (seenNote) noteGone();
       }, () => {});
     });
   }
@@ -437,6 +479,8 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     for (const u of hostSubs) { try { u(); } catch (e) {} }
     hostSubs = []; actingHost = false; hostState = null; joinsSnap = null;
     clearTimeout(botTimer); botTimer = null;
+    handled.clear();          // a later spell as host re-reads any notes still waiting
+    if (requests.length) { requests = []; renderPrompt(); }
   }
 
   let joinsSnap = null, joinsBusy = false, joinsRerun = false;
@@ -446,11 +490,15 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     if (joinsBusy) { joinsRerun = true; return; }
     joinsBusy = true;
     try {
+      // A joiner who gave up (deleted their note) is no longer asking.
+      const live = new Set(joinsSnap.docs.map((d) => d.id));
+      if (requests.some((q) => !live.has(q.uid))) { requests = requests.filter((q) => live.has(q.uid)); requestsChanged(); }
       for (const d of joinsSnap.docs) {
         const j = d.data(), uid = d.id;
         const key = uid + ":" + tsMillis(j.at) + ":" + !!j.leave;
         if (handled.has(key)) continue;
         handled.add(key);
+        requests = requests.filter((q) => q.uid !== uid);
         const seats = clone(room.seats);
         let uids = room.uids.slice();
         if (j.leave) {
@@ -460,23 +508,20 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
         } else if (!uids.includes(uid)) {
           let i = -1;
           if (room.status === "lobby") i = seats.findIndex((s) => s.kind === "empty");
-          else i = seats.findIndex((s) => s.kind === "human" && s.name === j.name && !isOnline(s.uid));
-          if (i >= 0) {
-            if (seats[i].uid) uids = uids.filter((u) => u !== seats[i].uid);
-            seats[i] = { kind: "human", name: cleanName(j.name), uid };
-            uids.push(uid);
-            delete lastHand[uid];
+          else {
+            // Seats belong to a login (uid), not a name. A new login gets a
+            // named seat only if the host marked it open or says Allow.
+            const n = seats.findIndex((s) => s.kind === "human" && s.name === j.name && !isOnline(s.uid));
+            if (n >= 0 && (seats[n].open || !seats[n].uid)) i = n;
+            else if (n >= 0) {
+              requests.push({ uid, name: cleanName(j.name), seat: n, seatName: seats[n].name, ref: d.ref });
+              requestsChanged(requests[requests.length - 1]);
+              continue;   // the note stays until the host answers
+            } else i = seats.findIndex((s) => s.kind === "computer" && s.open);
           }
+          if (i >= 0) uids = giveSeat(seats, uids, i, uid, j.name);
         }
-        if (JSON.stringify(seats) !== JSON.stringify(room.seats)) {
-          if (room.status === "playing" && hostState) {
-            room = Object.assign({}, room, { seats, seatUids: seats.map((s) => s.uid), uids });
-            await publish({ seats, seatUids: room.seatUids, uids });
-          } else {
-            await F.updateDoc(P.room(code), { seats, seatUids: seats.map((s) => s.uid), uids, updatedAt: F.serverTimestamp(), expireAt: expireAt() });
-            room = Object.assign({}, room, { seats, seatUids: seats.map((s) => s.uid), uids });
-          }
-        }
+        await saveSeats(seats, uids);
         await F.deleteDoc(d.ref).catch(() => {});
       }
     } catch (e) { fail(e); }
@@ -484,6 +529,102 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
       joinsBusy = false;
       if (joinsRerun) { joinsRerun = false; processJoins(); }
       scheduleBots();
+    }
+  }
+
+  /** Put login `uid` into seat i (mutates seats). Returns the new member list. */
+  function giveSeat(seats, uids, i, uid, name) {
+    let u = uids.slice();
+    if (seats[i].uid) u = u.filter((x) => x !== seats[i].uid);
+    seats[i] = { kind: "human", name: cleanName(seats[i].kind === "human" ? seats[i].name : name), uid };
+    u.push(uid);
+    delete lastHand[uid];
+    return u;
+  }
+
+  async function saveSeats(seats, uids) {
+    if (JSON.stringify(seats) === JSON.stringify(room.seats) && JSON.stringify(uids) === JSON.stringify(room.uids)) return;
+    const upd = { seats, seatUids: seats.map((s) => s.uid), uids };
+    if (room.status === "playing" && hostState) {
+      room = Object.assign({}, room, upd);
+      await publish(upd);
+    } else {
+      await F.updateDoc(P.room(code), Object.assign({ updatedAt: F.serverTimestamp(), expireAt: expireAt() }, upd));
+      room = Object.assign({}, room, upd);
+    }
+  }
+
+  // ------------------------------------------------------------ seat requests (host)
+  function requestsChanged(added) {
+    if (added) ev.emit("seatRequest", {
+      uid: added.uid, name: added.name, seat: added.seat, seatName: added.seatName,
+      allow: () => answerSeat(added.uid, true), deny: () => answerSeat(added.uid, false),
+    });
+    renderPrompt();
+    changed();
+  }
+
+  /** Host: Allow (true) or Deny (false) a request for someone else's seat. */
+  async function answerSeat(uid, yes) {
+    try {
+      needHost();
+      const q = requests.find((x) => x.uid === uid);
+      if (!q) throw new Error("That request is gone.");
+      requests = requests.filter((x) => x !== q);
+      requestsChanged();
+      if (yes) {
+        const s = room.seats[q.seat];
+        if (!s || s.kind !== "human" || s.name !== q.seatName) throw new Error("That seat has changed.");
+        if (isOnline(s.uid)) throw new Error(s.name + " is back online.");
+        if (!room.uids.includes(uid)) {
+          const seats = clone(room.seats);
+          await saveSeats(seats, giveSeat(seats, room.uids, q.seat, uid, q.name));
+        }
+      }
+      await F.deleteDoc(q.ref).catch(() => {});
+      scheduleBots();
+      return { ok: true };
+    } catch (e) {
+      const q = requests.find((x) => x.uid === uid);
+      if (!q && code) F.deleteDoc(P.join(uid)).catch(() => {});
+      return fail(e);
+    }
+  }
+
+  /** Minimal built-in Allow / Deny card, shown only if the game has no "seatRequest" listener. */
+  function renderPrompt() {
+    const doc = globalThis.document;
+    if (!doc || !doc.body) return;
+    let box = doc.getElementById("online-seat-requests");
+    if (!actingHost || !requests.length || ev.count("seatRequest")) { if (box) box.remove(); return; }
+    if (!box) {
+      box = doc.createElement("div");
+      box.id = "online-seat-requests";
+      box.style.cssText = "position:fixed;left:50%;bottom:calc(16px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:2147483647;display:flex;flex-direction:column;gap:8px;width:min(360px,calc(100vw - 32px));font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif";
+      doc.body.appendChild(box);
+    }
+    box.textContent = "";
+    for (const q of requests) {
+      const card = doc.createElement("div");
+      card.setAttribute("role", "alertdialog");
+      card.style.cssText = "background:#1a1e2b;color:#e8eaf0;border:1px solid #2a3042;border-radius:14px;padding:12px 14px;box-shadow:0 8px 24px rgba(0,0,0,.45)";
+      const msg = doc.createElement("div");
+      msg.textContent = "Someone on another device typed “" + q.seatName + "” and wants " + q.seatName + "’s seat.";
+      const row = doc.createElement("div");
+      row.style.cssText = "display:flex;gap:8px;margin-top:10px";
+      const btn = (label, filled, yes) => {
+        const b = doc.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        b.dataset.answer = yes ? "allow" : "deny";
+        b.style.cssText = "flex:1;font:inherit;font-weight:600;border-radius:10px;padding:10px 14px;cursor:pointer;" +
+          (filled ? "background:#6ea8fe;color:#0f1117;border:0" : "background:transparent;color:#e8eaf0;border:1px solid #6ea8fe");
+        b.onclick = () => answerSeat(q.uid, yes);
+        return b;
+      };
+      row.append(btn("Allow", true, true), btn("Deny", false, false));
+      card.append(msg, row);
+      box.appendChild(card);
     }
   }
 
@@ -566,7 +707,13 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
       if (!seats[i]) throw new Error("No such seat.");
       if (seats[i].uid === me) throw new Error("That's your seat.");
       let uids = room.uids;
-      if (room.status === "lobby") {
+      if (kind === "open" && room.status !== "lobby") {
+        // Offer the seat up: the next person who joins takes it without asking
+        // (a computer seat: under any name; a player's seat: under that name).
+        if (seats[i].kind === "empty") throw new Error("No such seat.");
+        seats[i] = Object.assign({}, seats[i], { open: true });
+      } else if (room.status === "lobby") {
+        if (kind === "open") kind = "empty";
         if (!["computer", "empty"].includes(kind)) throw new Error("A seat can be a computer or empty.");
         if (seats[i].uid) uids = uids.filter((u) => u !== seats[i].uid);
         seats[i] = kind === "computer" ? { kind, name: name || "Computer " + (i + 1), uid: "" } : { kind, name: "", uid: "" };
@@ -675,13 +822,16 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     for (const u of subs) { try { u(); } catch (e) {} }
     subs = []; memberSubs = false;
     stopHost(); stopTimers();
-    room = null; mine = null; code = null; presence = {}; joinPending = false; myHandV = -1;
+    room = null; mine = null; code = null; presence = {}; joinPending = false; askingHost = false; myHandV = -1;
   }
 
   return {
     mode: "online",
     on: ev.on,
     ready, createRoom, joinRoom, resume, setSeat, setOptions, start, act, leave, close, sweep,
+    /** Host: answer a seat request (see the "seatRequest" event / snap.seatRequests). */
+    allowSeat: (uid) => answerSeat(uid, true),
+    denySeat: (uid) => answerSeat(uid, false),
     view: snapshot,
     get uid() { return me; },
     get code() { return code; },

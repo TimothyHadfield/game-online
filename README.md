@@ -66,7 +66,9 @@ await online.resume();                              // true if a reload put us b
 const { ok, code, message } = await online.createRoom({ name: "Tim",
       seats: ["human", "empty", "computer", "empty"], options: { jackOfDiamonds: true } });
 await online.joinRoom("K7M2Q", "Sam");              // { ok, seat } or { ok:false, message }
-await online.setSeat(2, "empty" | "computer");      // host, lobby. During play: "computer" only (takes over a seat)
+await online.setSeat(2, "empty" | "computer");      // host, lobby. During play: "computer" (takes over a seat) or "open" (offer it up)
+online.on("seatRequest", (rq) => ask(rq));          // OPTIONAL. host: rq = { uid, name, seat, seatName, allow(), deny() }
+await online.allowSeat(uid); await online.denySeat(uid);   // host: same as rq.allow() / rq.deny()
 await online.setOptions({ ... });                   // host, lobby
 await online.start();                               // host; empty seats become computers
 await online.act(action);                           // your move (checked again by the host's apply)
@@ -83,7 +85,7 @@ Every call returns `{ ok: true, ... }` or `{ ok: false, message }` — it never 
   mode: "local" | "online",
   status: "lobby" | "playing" | "finished" | "joining" | "closed" | "left" | "none",
   code: "K7M2Q",                 // online only; show it big so friends can type it
-  seats: [{ kind: "human"|"computer"|"empty", name, online, isHost }],
+  seats: [{ kind: "human"|"computer"|"empty", name, online, isHost, open }],  // open: host offered it up
   mySeat: 1,                     // -1 if not seated
   isHost: false,
   hostAway: false,               // host's heartbeat lost; another player takes over within ~80 s
@@ -91,9 +93,23 @@ Every call returns `{ ok: true, ... }` or `{ ok: false, message }` — it never 
   pub:  publicView(state),       // null in the lobby
   mine: privateView(state, mySeat),
   toAct: [2], myTurn: false,
+  seatRequests: [{ uid, name, seat, seatName }],  // host only: people asking for someone's seat
+  askingHost: false,             // while status is "joining": true = waiting for the host to Allow
   error: null | "plain message",
 }
 ```
+
+### Seats belong to a login, not a name
+
+Mid-game, **the same browser** (same anonymous login) gets its own seat back at once, after a reload
+or a closed tab (`resume()` or `joinRoom` with the code). **A different device typing a seated
+player's name does NOT get that seat** unless:
+- the host says **Allow**: online.js fires `"seatRequest"` on the host. If your game has no
+  `"seatRequest"` listener, online.js shows its own small Allow / Deny card at the bottom of the host's
+  screen (no game code needed). Unanswered = no seat; the joiner gets
+  "That seat belongs to someone else, ask the host." on Deny, or after 2 minutes.
+- or the host marked the seat open with `setSeat(i, "open")` (a player's seat: whoever types that name
+  next takes it; a computer seat: the next joiner takes it under their own name).
 
 `change` is held back until your private doc matches the room version, so you never draw the new
 table with the old hand.
@@ -103,7 +119,7 @@ table with the old hand.
 | Thing | How |
 |---|---|
 | Room code | 5 characters, no O/0/I/1. Rooms can be fetched by code, never listed. |
-| Join | Joiner leaves a note; the host's browser seats them in the first empty seat. Mid-game, a player who reloads/lost their login rejoins **their old seat by typing the same name** (only if that seat's player is offline). |
+| Join | Joiner leaves a note; the host's browser seats them in the first empty seat. Mid-game, the same login walks straight back into its seat; a **different** login typing an offline player's name needs the host's Allow (or an open seat). Only the host can write who sits where (rules-tested). |
 | Moves | Host's own moves apply instantly. Others write a move doc; rules only accept it for **your seat, when your seat is in `toAct`**; the host applies it with your `apply` (illegal = dropped). |
 | Computers | Run in the host's browser, one step every `botDelayMs`. |
 | Hidden info | `hands/{uid}` — only that uid can read it (rules-tested). The host's browser holds the full state (no free server can avoid that; accepted, same as Cribbage). |
@@ -142,6 +158,15 @@ sites. Keep games under it:
 - **Two-browser check:** `test/two-browsers.mjs` here opens two headless pages against the real project;
   copy it and point it at your page.
 - The security rules are tested once, here (`cd test && npm test`). Games don't redo it.
+
+## Changelog
+
+- **2026-10-20 — security fix, re-copy `online.js`.** Before this, anyone who joined a game in
+  progress with an away player's NAME got that player's seat and hand. Now a seat belongs to the
+  login (uid); a different login needs the host's Allow or an open seat (see "Seats belong to a
+  login"). The API only grew (`"seatRequest"` event, `allowSeat`/`denySeat`, `setSeat(i, "open")`,
+  `seats[].open`, `seatRequests`, `askingHost`); no game code has to change.
+  **Every game: copy the new `online.js` over your `js/online.js` unchanged.**
 
 ## 7. This repo
 
