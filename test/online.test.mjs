@@ -61,6 +61,10 @@ assert.equal(made.ok, true, made.message);
 assert.match(made.code, /^[A-HJ-NP-Z2-9]{5}$/);
 await until(() => A.snap && A.snap.status === "lobby", "alice lobby");
 ok("alice creates room " + made.code);
+await until(() => A.snap.seats[0].online, "alice shows online");
+assert.equal(A.snap.seats[1].online, false, "an EMPTY seat must not show as online");
+assert.equal(A.snap.seats[2].online, true, "a computer seat shows as online");
+ok("lobby: empty seat offline, computer and host online");
 
 const j = await B.o.joinRoom(made.code.toLowerCase(), "Bob");
 assert.equal(j.ok, true, j.message);
@@ -251,6 +255,39 @@ ok("host close() deletes the room and every sub-document");
   assert.equal(asks.length, before, "open seat needs no approval");
   await until(() => H.snap.seats[2].kind === "human" && H.snap.seats[2].name === "Erin" && !H.snap.seats[2].open, "erin in seat 2");
   ok("host marks the computer seat open → erin takes it without a prompt");
+  await H.o.close();
+}
+
+// 9. a guest one update behind taps a move: refused (rules), but no scary "not in this room" error
+{
+  const H = client("st-host"), G = client("st-guest");
+  const m = await H.o.createRoom({ name: "Hana", seats: ["human", "empty"], options: { handSize: 3 } });
+  const R = "games/high-card/rooms/" + m.code;
+  assert.equal((await G.o.joinRoom(m.code, "Gus")).ok, true);
+  await until(() => H.snap.seats[1].kind === "human", "gus seated");
+  await H.o.start();
+  await until(() => G.snap && G.snap.status === "playing" && G.snap.myTurn && G.snap.mine, "gus to act");
+  let res = null, stale = false;
+  for (let tries = 0; tries < 5 && !stale; tries++) {
+    // the server moves on (toAct no longer has gus) …
+    await env.withSecurityRulesDisabled(async (ctx) => { await fsMod.updateDoc(fsMod.doc(ctx.firestore(), R), { toAct: [0] }); });
+    // … and gus taps before his copy has caught up
+    stale = G.o.view().toAct.includes(1);
+    if (stale) res = await G.o.act({ card: G.snap.mine.hand[0] });
+    else await env.withSecurityRulesDisabled(async (ctx) => { await fsMod.updateDoc(fsMod.doc(ctx.firestore(), R), { toAct: [0, 1] }); }).then(() => until(() => G.o.view().toAct.includes(1), "toAct back"));
+  }
+  assert.ok(stale, "could not catch the guest one update behind");
+  assert.equal(res.ok, false);
+  assert.doesNotMatch(res.message, /not be in this room|server said no/i, "stale tap shows the scary error");
+  assert.deepEqual(G.errors.filter((e) => /server said no/i.test(e)), [], "error event fired for a stale tap");
+  assert.equal(res.stale, true);
+  ok("stale tap refused quietly: " + res.message);
+  // a real non-member still gets the real error
+  const X = client("st-stranger");
+  await X.o.ready();
+  const xDb = fsMod.getFirestore(appMod.getApp("st-stranger"));
+  await assert.rejects(fsMod.addDoc(fsMod.collection(xDb, R + "/actions"), { by: X.o.uid, seat: 1, a: {}, at: fsMod.serverTimestamp(), expireAt: fsMod.Timestamp.fromMillis(Date.now() + 864e5) }), /permission/i);
+  ok("a stranger's move is still refused by the rules");
   await H.o.close();
 }
 

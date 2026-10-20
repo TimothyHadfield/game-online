@@ -82,4 +82,12 @@ ok("2,000 bot-only games end with one point per round, no duplicate cards");
   ok("pass-the-phone: per-seat views, no double moves");
 }
 
+// 6. An empty seat never shows as online.
+{
+  const room = createLocal({ game: highCard, seats: ["human", "empty", "computer"], botDelayMs: 1, rng: mulberry(9) });
+  assert.deepEqual(room.view(0).seats.map((s) => s.online), [true, false, true]);
+  room.close();
+  ok("local snapshot: empty seat offline, human and computer online");
+}
+
 console.log(`\nlocal: ${pass} passed`);

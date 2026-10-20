@@ -11,7 +11,8 @@ Shared online layer for ~25 game sites: "regular play online with a computer or 
 |---|---|
 | Firebase project `th-board-games` | Created 2026-10-19 via CLI. Web app, Firestore (default), **anonymous auth on** (`firebase deploy --only auth`). No billing. |
 | Rules + sweep indexes | **Deployed** (unchanged 2026-10-20). 78/78 emulator tests (7 new seat-takeover checks). |
-| online.js | createLocal / createOnline. 18/18 end-to-end emulator tests, 5/5 local tests. |
+| online.js | createLocal / createOnline. 21/21 end-to-end emulator tests, 6/6 local tests. |
+| Same-day fixes (2026-10-20) | Stale tap → `{ok:false, stale:true}` not "The server said no"; empty seats `online:false`; sign-in retry + silenced background auth/network-request-failed; createRoom = one plain write, sweep 15 s later. |
 | Seat takeover fix (2026-10-20) | A seat belongs to a login (uid), not a typed name. New login needs host Allow (built-in card or `seatRequest` event) or `setSeat(i,"open")`. Games must re-copy online.js (README Changelog). |
 | Demo | Live on Pages. Two-browser test passes on the LIVE site (WebKit iPhone size + Chromium). |
 
@@ -38,3 +39,6 @@ Shared online layer for ~25 game sites: "regular play online with a computer or 
 ## NOT verified
 - A real iPhone (Safari backgrounding → host takeover timing).
 - Quota use at scale (estimates in README are from emulator call counts).
+- Coup's "server said no once after a reload" was NOT reproduced (demo and a scratch copy of Coup both reload clean with the old and new online.js). Fixed the likely causes: stale-tap act (reproduced, tested) and a refused room listener (re-listens if still a member; untested, no way to trigger it in the emulator).
+- createRoom speed under load: plain write is one round trip instead of a transaction; not timed under real load.
+- The silenced auth/network-request-failed rejection: not reproduced; guard is a global unhandledrejection filter for that one code.

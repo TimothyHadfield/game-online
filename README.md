@@ -77,6 +77,8 @@ await online.close();                               // host: end the room for ev
 ```
 
 Every call returns `{ ok: true, ... }` or `{ ok: false, message }` — it never throws.
+`act` may return `{ ok: false, stale: true, message }` when your screen was one update behind:
+show the message gently (or nothing) and let the player look again; no `error` event fires.
 
 ### The snapshot your UI renders (same shape local and online)
 
@@ -85,7 +87,7 @@ Every call returns `{ ok: true, ... }` or `{ ok: false, message }` — it never 
   mode: "local" | "online",
   status: "lobby" | "playing" | "finished" | "joining" | "closed" | "left" | "none",
   code: "K7M2Q",                 // online only; show it big so friends can type it
-  seats: [{ kind: "human"|"computer"|"empty", name, online, isHost, open }],  // open: host offered it up
+  seats: [{ kind: "human"|"computer"|"empty", name, online, isHost, open }],  // online: computer, or a present human (never an empty seat); open: host offered it up
   mySeat: 1,                     // -1 if not seated
   isHost: false,
   hostAway: false,               // host's heartbeat lost; another player takes over within ~80 s
@@ -166,6 +168,15 @@ sites. Keep games under it:
   login (uid); a different login needs the host's Allow or an open seat (see "Seats belong to a
   login"). The API only grew (`"seatRequest"` event, `allowSeat`/`denySeat`, `setSeat(i, "open")`,
   `seats[].open`, `seatRequests`, `askingHost`); no game code has to change.
+  Same release, also fixed: (1) a guest whose screen was one update behind (or still catching up
+  after a reload) who tapped a move got "The server said no — you may not be in this room any
+  more."; now `act` returns `{ ok:false, stale:true, message:"The table just changed. Check it and
+  try again." }` with no `error` event (the rules still refuse the move); a refused room listener
+  quietly re-listens if the server still lists you. (2) Empty seats showed `online: true`; now
+  `online` is true only for computer seats and present humans. (3) Sign-in retries twice on
+  auth/network-request-failed, and the SDK's background token-refresh rejection of that code no
+  longer shows as an uncaught error. (4) `createRoom` writes the room in one plain write (no
+  transaction) and sweeps old rooms 15 s later, so it's faster under load.
   **Every game: copy the new `online.js` over your `js/online.js` unchanged.**
 
 ## 7. This repo

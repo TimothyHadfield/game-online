@@ -51,6 +51,7 @@ export const STALE_MS = 75000;          // must match hostStale() in firestore.r
 const TTL_MS = 2 * 24 * 3600 * 1000;    // rules allow at most 3 days ahead
 const MAX_SEATS = 12;
 const NAME_MAX = 20;
+const STALE_MSG = "The table just changed. Check it and try again.";
 
 // ------------------------------------------------------------ tiny helpers
 function emitter() {
@@ -106,7 +107,7 @@ export function createLocal({ game, seats, options = {}, botDelayMs = 600, rng =
     const toAct = over ? [] : game.toAct(state);
     return {
       mode: "local", status: over ? "finished" : "playing", code: null,
-      seats: S.map((s) => ({ kind: s.kind, name: s.name, online: true })),
+      seats: S.map((s) => ({ kind: s.kind, name: s.name, online: s.kind !== "empty" })),
       toAct, pub: game.publicView(state),
       mySeat: seat, mine: seat == null ? null : game.privateView(state, seat),
       myTurn: seat != null && toAct.includes(seat), isHost: true, hostAway: false,
@@ -197,10 +198,33 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
       }
       F = Object.assign({}, mods.firestore, { signInAnonymously: mods.auth.signInAnonymously });
     }
-    if (!auth.currentUser) await F.signInAnonymously(auth);
+    // Sign-in can fail on a flaky connection (auth/network-request-failed): retry twice.
+    for (let i = 0; !auth.currentUser; i++) {
+      try { await F.signInAnonymously(auth); }
+      catch (e) { if (i >= 2 || !/network|timeout|unavailable/.test(String(e && e.code))) throw e; await new Promise((r) => setTimeout(r, 1000 * (i + 1))); }
+    }
     me = auth.currentUser.uid;
     return me;
   }
+
+  // The auth SDK refreshes its token in the background; on a dropped
+  // connection that promise rejects with auth/network-request-failed and
+  // nobody can catch it. It is harmless (Firestore retries), so keep it out
+  // of the page's error log.
+  if (globalThis.addEventListener && !globalThis.__onlineAuthNetGuard) {
+    globalThis.__onlineAuthNetGuard = true;
+    globalThis.addEventListener("unhandledrejection", (e) => {
+      if (e && e.reason && e.reason.code === "auth/network-request-failed") e.preventDefault();
+    });
+  }
+
+  /** Is this login still a member of the room, per the server (not our maybe-stale copy)? */
+  async function stillMember() {
+    if (!code || !me) return false;
+    try { const s = await F.getDoc(P.room(code)); return s.exists() && (s.data().uids || []).includes(me); }
+    catch (e) { return false; }
+  }
+  const denied = (e) => String((e && e.code) || "").includes("permission-denied");
 
   const P = {
     room: (c) => F.doc(db, "games", gameId, "rooms", c),
@@ -226,7 +250,7 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     const isHost = room.hostUid === me;
     return {
       mode: "online", code, status: room.status,
-      seats: room.seats.map((s) => ({ kind: s.kind, name: s.name, online: s.kind !== "human" || isOnline(s.uid), isHost: s.uid === room.hostUid && !!s.uid, open: !!s.open })),
+      seats: room.seats.map((s) => ({ kind: s.kind, name: s.name, online: s.kind === "computer" || (s.kind === "human" && isOnline(s.uid)), isHost: s.uid === room.hostUid && !!s.uid, open: !!s.open })),
       mySeat: seat, isHost,
       hostAway: room.hostUid !== me && !isOnline(room.hostUid),
       options: room.options || {},
@@ -276,17 +300,17 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     for (let attempt = 0; attempt < 8; attempt++) {
       const c = newCode();
       try {
-        await F.runTransaction(db, async (tx) => {
-          const r = await tx.get(P.room(c));
-          if (r.exists()) throw new Error("taken");
-          tx.set(P.room(c), {
-            gameId, hostUid: me, uids: [me], seats: S, seatUids: S.map((s) => s.uid),
-            status: "lobby", options: clone(options), pubJson: "null", toAct: [], v: 0, hv: {},
-            createdAt: F.serverTimestamp(), updatedAt: F.serverTimestamp(), expireAt: expireAt(),
-          });
+        // One plain write (no transaction: that was a read + a commit, slow under
+        // load). If the code is already someone's room the rules refuse it as an
+        // update by a non-host, and we try another code.
+        await F.setDoc(P.room(c), {
+          gameId, hostUid: me, uids: [me], seats: S, seatUids: S.map((s) => s.uid),
+          status: "lobby", options: clone(options), pubJson: "null", toAct: [], v: 0, hv: {},
+          createdAt: F.serverTimestamp(), updatedAt: F.serverTimestamp(), expireAt: expireAt(),
         });
         await attach(c);
-        sweep().catch(() => {});
+        // Sweep later, so it doesn't compete with the new room's first updates.
+        setTimeout(() => sweep().catch(() => {}), 15000);
         return { ok: true, code: c };
       } catch (e) {
         if (String(e.message) !== "taken" && !String(e.code || "").includes("permission")) return fail(e);
@@ -379,7 +403,8 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
   async function attach(c) {
     code = c;
     lastError = null;
-    subs.push(F.onSnapshot(P.room(c), (snap) => {
+    const unsubRoom = F.onSnapshot(P.room(c), (snap) => {
+      relistens = 0;
       if (!snap.exists()) { room = null; mine = null; store.del(RESUME_KEY); stopTimers(); stopHost(); ev.emit("change", { mode: "online", status: "closed", code }); return; }
       const wasMember = room && room.uids.includes(me);
       room = snap.data();
@@ -398,7 +423,25 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
       else if (room.hostUid !== me && actingHost) stopHost();
       if (actingHost) scheduleBots();
       changed();
-    }, (e) => fail(e)));
+    }, (e) => roomListenError(c, e));
+    unsubRoom.__room = true;
+    subs.push(unsubRoom);
+  }
+
+  // A listener can be refused for a moment around a reload (stale login token,
+  // a dropped channel). If the server still lists us, quietly listen again.
+  let relistens = 0;
+  async function roomListenError(c, e) {
+    if (denied(e) && code === c && relistens < 3 && await stillMember()) {
+      relistens++;
+      setTimeout(() => {
+        if (code !== c) return;
+        subs = subs.filter((u) => { if (u.__room) { try { u(); } catch (x) {} return false; } return true; });
+        attach(c);
+      }, 1000 * relistens);
+      return;
+    }
+    fail(e);
   }
 
   let memberSubs = false;
@@ -763,7 +806,14 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     try {
       await F.addDoc(P.actions(), { by: me, seat, a: clone(action), at: F.serverTimestamp(), expireAt: expireAt() });
       return { ok: true };
-    } catch (e) { return fail(e); }
+    } catch (e) {
+      // Our copy of the table was one update behind (it was no longer this
+      // seat's turn, or a reload was still catching up). The rules refused the
+      // move, which is right, but we are still in the room: say so gently
+      // and don't raise the scary "not in this room" error.
+      if (denied(e) && await stillMember()) return { ok: false, stale: true, message: STALE_MSG };
+      return fail(e);
+    }
   }
 
   // ------------------------------------------------------------ leaving
