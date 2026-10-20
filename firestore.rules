@@ -1,0 +1,164 @@
+rules_version = '2';
+
+// ============================================================================
+// Security rules for the shared board-game project (th-board-games).
+// One rule set serves EVERY game: each game lives under games/{gameId}/...
+// and nothing here knows any game's rules.
+//
+// These rules are the whole security boundary: no server, anonymous sign-in,
+// so whatever they allow, anyone on the internet can do. Deploy with
+//     firebase deploy --only firestore:rules
+// and only after `cd test && npm test` passes.
+//
+// THE INVARIANTS (each has a test in test/rules.test.js):
+//   1. A player can read their own hand and nobody else's — not even the host
+//      can read another player's hand doc (the host's browser has the full
+//      state anyway; nothing is SERVED to the wrong person).
+//   2. Only the current host moves the game on (writes the room, hands, state).
+//   3. A player may only submit a move for their own seat, and only when the
+//      room says that seat is to act.
+//   4. Rooms can be fetched by code but never listed (the code is the invite).
+//   5. Every document must expire within 3 days. Expired documents may be
+//      listed and deleted by anyone (online.js sweeps them), because Firestore
+//      TTL policies need a billing account and this project stays on Spark.
+//   6. Host takeover only when the host's heartbeat is over 75 s old.
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function d() { return request.resource.data; }
+    function touches(keys) { return d().diff(resource.data).affectedKeys().hasOnly(keys); }
+    function expiresSoon() {
+      return d().expireAt is timestamp
+          && d().expireAt > request.time
+          && d().expireAt < request.time + duration.value(3, 'd');
+    }
+
+    match /games/{gameId}/rooms/{code} {
+
+      function validRoom() {
+        return gameId.matches('^[a-z0-9-]{1,32}$')
+            && code.matches('^[A-Z0-9]{4,8}$')
+            && d().keys().hasOnly(['gameId', 'hostUid', 'uids', 'seats', 'seatUids', 'status',
+                                   'options', 'pubJson', 'toAct', 'v', 'hv',
+                                   'createdAt', 'updatedAt', 'expireAt'])
+            && d().gameId == gameId
+            && d().uids is list && d().uids.size() <= 12
+            && d().seats is list && d().seats.size() >= 1 && d().seats.size() <= 12
+            && d().seatUids is list && d().seatUids.size() == d().seats.size()
+            && d().hostUid in d().uids
+            && d().status in ['lobby', 'playing', 'finished']
+            && d().toAct is list
+            && expiresSoon();
+      }
+
+      // Host's heartbeat older than 75 s (or missing) = the host is gone.
+      function hostStale() {
+        let p = /databases/$(database)/documents/games/$(gameId)/rooms/$(code)/presence/$(resource.data.hostUid);
+        return !exists(p) || get(p).data.at < request.time - duration.value(75, 's');
+      }
+
+      allow get:  if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn() && validRoom()
+                    && d().hostUid == uid()
+                    && d().uids == [uid()]
+                    && d().status == 'lobby'
+                    && d().v == 0;
+
+      allow update: if signedIn() && (
+                      // the host runs the room (it may also hand hosting to another member)
+                      (resource.data.hostUid == uid() && validRoom()
+                        && d().gameId == resource.data.gameId)
+                      ||
+                      // a member takes over from a host who has gone quiet
+                      (uid() in resource.data.uids
+                        && d().hostUid == uid()
+                        && touches(['hostUid'])
+                        && hostStale())
+                    );
+
+      allow delete: if signedIn() && resource.data.hostUid == uid();
+
+      // ---- helpers for the sub-collections (one document read each) ----
+      function room() { return get(/databases/$(database)/documents/games/$(gameId)/rooms/$(code)).data; }
+      function isHost() { return signedIn() && room().hostUid == uid(); }
+      function isMember() { return signedIn() && uid() in room().uids; }
+
+      // ---- 1. your hand: only you read it, only the host writes it ----
+      match /hands/{handUid} {
+        allow get:   if signedIn() && handUid == uid();
+        allow list:  if false;
+        allow create, update: if isHost() && d().keys().hasOnly(['json', 'v', 'expireAt']) && expiresSoon();
+        allow delete: if isHost();
+      }
+
+      // ---- the full state, for host reload and host takeover ----
+      match /host/{docId} {
+        allow read, delete: if isHost();
+        allow create, update: if isHost() && expiresSoon();
+      }
+
+      // ---- 3. moves in: your own seat, your turn only ----
+      match /actions/{actionId} {
+        allow read:   if isHost();
+        allow create: if isMember()
+                      && d().keys().hasOnly(['by', 'seat', 'a', 'at', 'expireAt'])
+                      && d().by == uid()
+                      && d().at == request.time
+                      && d().seat is int
+                      && d().seat >= 0 && d().seat < room().seatUids.size()
+                      && room().seatUids[d().seat] == uid()
+                      && room().status == 'playing'
+                      && d().seat in room().toAct
+                      && expiresSoon();
+        allow update: if false;
+        allow delete: if isHost();
+      }
+
+      // ---- heartbeat ----
+      match /presence/{pUid} {
+        allow read: if isMember();
+        allow create, update: if signedIn() && pUid == uid() && isMember()
+                      && d().keys().hasOnly(['at', 'expireAt'])
+                      && d().at == request.time
+                      && expiresSoon();
+        allow delete: if signedIn() && (pUid == uid() || isHost());
+      }
+
+      // ---- "let me in" / "I'm leaving" notes, read by the host ----
+      match /joins/{jUid} {
+        allow get:  if signedIn() && (jUid == uid() || isHost());
+        allow list: if isHost();
+        allow create, update: if signedIn() && jUid == uid()
+                      && d().keys().hasOnly(['name', 'leave', 'at', 'expireAt'])
+                      && d().name is string && d().name.size() >= 1 && d().name.size() <= 20
+                      && d().leave is bool
+                      && d().at == request.time
+                      && expiresSoon();
+        allow delete: if signedIn() && (jUid == uid() || isHost());
+      }
+    }
+
+    // ---- 5. self-cleaning (TTL policies need billing, so the clients sweep) ----
+    // Anyone signed in may find and delete documents whose expireAt has
+    // PASSED — nothing live. Queries must filter `expireAt < now`. Host
+    // writes refresh expireAt, so an active room is never swept.
+    function expired() { return signedIn() && resource.data.expireAt < request.time; }
+    match /{path=**}/rooms/{x}    { allow list, delete: if expired(); }
+    match /{path=**}/hands/{x}    { allow list, delete: if expired(); }
+    match /{path=**}/host/{x}     { allow list, delete: if expired(); }
+    match /{path=**}/actions/{x}  { allow list, delete: if expired(); }
+    match /{path=**}/presence/{x} { allow list, delete: if expired(); }
+    match /{path=**}/joins/{x}    { allow list, delete: if expired(); }
+
+    // Anything else is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

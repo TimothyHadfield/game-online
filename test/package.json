@@ -1,0 +1,13 @@
+{
+  "name": "game-online-tests",
+  "private": true,
+  "type": "commonjs",
+  "description": "Dev-only tests. The sites themselves have no dependencies.",
+  "scripts": {
+    "test": "node local.test.mjs && firebase emulators:exec --only firestore,auth --project demo-boardgames \"node rules.test.js && node online.test.mjs\""
+  },
+  "dependencies": {
+    "@firebase/rules-unit-testing": "^5.0.1",
+    "firebase": "12.16.0"
+  }
+}

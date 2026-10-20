@@ -1,0 +1,15 @@
+{
+  "indexes": [],
+  "fieldOverrides": [
+    { "collectionGroup": "rooms",    "fieldPath": "expireAt", "indexes": [{ "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }] },
+    { "collectionGroup": "hands",    "fieldPath": "expireAt", "indexes": [{ "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }] },
+    { "collectionGroup": "host",     "fieldPath": "expireAt", "indexes": [{ "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }] },
+    { "collectionGroup": "actions",  "fieldPath": "expireAt", "indexes": [{ "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }] },
+    { "collectionGroup": "presence", "fieldPath": "expireAt", "indexes": [{ "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }] },
+    { "collectionGroup": "joins",    "fieldPath": "expireAt", "indexes": [{ "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }] },
+    { "collectionGroup": "rooms",    "fieldPath": "pubJson",  "indexes": [] },
+    { "collectionGroup": "hands",    "fieldPath": "json",     "indexes": [] },
+    { "collectionGroup": "host",     "fieldPath": "s",        "indexes": [] },
+    { "collectionGroup": "actions",  "fieldPath": "a",        "indexes": [] }
+  ]
+}
