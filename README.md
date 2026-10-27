@@ -16,7 +16,12 @@ plan, no billing) serves all the games. Demo: <https://timothyhadfield.github.io
    `king-of-tokyo`, `seven-wonders`, `evolution`. (The demo uses `high-card`.)
 3. **No rules file, no Firebase CLI, no deploy in your repo.** The rules here are game-agnostic and
    already deployed. Do not create your own Firebase project or `firebase.json`.
-4. The Firebase SDK (~250 KB) loads only when the player first opens online play
+4. Load it with the kit's cache stamp, `online.js?v=<stamp>`, where the stamp is what
+   `node tools/stamp.mjs` prints (from online.js's content, so it changes exactly when online.js
+   does). Use the same stamped URL in every import of it in the game, and bump the `?v=` of the
+   file holding the import (plus pwa.js `data-version`). `node tools/stamp.mjs --check <game folder>`
+   lists any stale reference. A phone then can't keep an old copy and play a room with mixed code.
+5. The Firebase SDK (~250 KB) loads only when the player first opens online play
    (`createOnline` does a lazy `import()` from gstatic). Local play never touches the network.
 
 ## 2. Your game supplies pure functions
@@ -182,6 +187,9 @@ Keep games under it:
 
 ## Changelog
 
+- **2026-10-27 — cache stamp.** Games load `online.js?v=<stamp>` (`node tools/stamp.mjs`; v2 is
+  `a3d0418b`). After every re-copy, update the stamp in each game and run `--check` (see §1 step 4).
+
 - **2026-10-27 (v2) — about one room write per turn. Re-copy `online.js`.** The host batches moves
   into frames and writes the room only when someone else must act, seats change, the game ends or
   20 s pass; a single waiting friend gets news in their own hand doc instead. Heartbeats: the host
@@ -227,6 +235,7 @@ Keep games under it:
 | File | What |
 |---|---|
 | `online.js` | the module (copy this) |
+| `tools/stamp.mjs` | prints the cache stamp for `online.js?v=`; `--check <game>...` finds stale references |
 | `firestore.rules`, `firestore.indexes.json` (sweep indexes), `firebase.json` | deployed to `th-board-games` (anonymous auth on) |
 | `test/real-smoke.mjs` | 2 clients play a full game on the REAL project (node) |
 | `test/v2.test.mjs`, `test/fakefs.mjs` | cost/batching checks on a billing fake with a virtual clock (no emulator) |
