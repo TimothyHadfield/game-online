@@ -28,6 +28,7 @@ Old (pre-v2) heartbeat cost per room-hour (writes / reads): 2 players 300 / 600 
 - Tim 2026-10-27: "For Online play, talk to me before you're going to set something up that requires anything more than the firebase system we already have set up or takes up a large portion of our free plan that we have."
 
 ## Traps
+- **Games load `online.js?v=<stamp>`** (`node tools/stamp.mjs`, a content hash; v2 = `a3d0418b`). After any change to online.js, every game copy needs the new stamp; `node tools/stamp.mjs --check <game>...` lists stale ones. Stamped 2026-10-27: 25 games. NOT yet: Seven_Wonders, King_of_Tokyo, Coup (builders were in them); Secret_Hitler has its own online.js.
 - **Firestore TTL policies need billing.** The deploy fails with "billing disabled" and leaves the old rules unreleased. Never add `ttl: true`. Cleanup = rules let anyone list/delete only expired docs + `sweep()` on createRoom.
 - Sweep queries must use a cutoff about 10 min in the past: client clocks run ahead of `request.time`, and rules then deny the list.
 - `withSecurityRulesDisabled` doesn't return the callback's value (use an outer variable).
