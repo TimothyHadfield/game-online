@@ -195,9 +195,14 @@ ok("bob's own login CANNOT read alice's hand or the full state");
 const r1 = await B.o.act({ card: B.snap.mine.hand[0] });
 assert.equal(r1.ok, true);
 await until(() => A.snap.pub.chosen[1] === true || A.snap.pub.round === 1, "bob's pick lands");
+// v2: the room's toAct may still list bob (the host batches until the next person must act),
+// so the rules may let the doc in; the host's own turn check must then drop it.
+await until(() => B.snap.mine && B.snap.mine.picked != null, "bob sees his pick");
+const picked = B.snap.mine.picked, handLeft = B.snap.mine.hand.length;
 const sneak = await fsMod.addDoc(fsMod.collection(bobDb, "games/high-card/rooms/" + made.code + "/actions"), { by: bobAuth.currentUser.uid, seat: 1, a: { card: B.snap.mine.hand[0] }, at: fsMod.serverTimestamp(), expireAt: fsMod.Timestamp.fromMillis(Date.now() + 864e5) }).then(() => "ok", (e) => e.code);
-assert.match(String(sneak), /permission/);
-ok("bob's second move in the same round is refused by the rules (out of turn)");
+await wait(1500);
+assert.ok(/permission/.test(String(sneak)) || (A.o.view().pub.round === 0 && B.o.view().mine.picked === picked && B.o.view().mine.hand.length === handLeft), "bob's second pick took effect");
+ok("bob's second move in the same round has no effect (" + (/permission/.test(String(sneak)) ? "refused by the rules" : "dropped by the host") + ")");
 
 // play round 1 to the end (computer seat 2 is played by alice's browser)
 const before = { ...counts };
@@ -211,8 +216,10 @@ console.log(`        cost of one 3-seat round: ${counts.writes - before.writes} 
 await A.o._detach();
 await env.withSecurityRulesDisabled(async (ctx) => {
   await fsMod.setDoc(fsMod.doc(ctx.firestore(), "games/high-card/rooms/" + made.code + "/presence/" + aliceUid), { at: fsMod.Timestamp.fromMillis(Date.now() - 120e3), expireAt: fsMod.Timestamp.fromMillis(Date.now() + 864e5) });
+  // v2: a room write counts as a host beat too, so her last room write is 2 min old as well
+  await fsMod.updateDoc(fsMod.doc(ctx.firestore(), "games/high-card/rooms/" + made.code), { updatedAt: fsMod.Timestamp.fromMillis(Date.now() - 120e3) });
 });
-await until(() => B.snap.isHost, "bob becomes host", 20000);
+await until(() => B.snap.isHost, "bob becomes host", 60000);   // v2: 40 s after the host's last sign (beat, room write or an answer to bob's move)
 ok("alice's heartbeat goes stale → bob takes over as host");
 
 assert.equal((await B.o.setSeat(0, "computer")).ok, true);
@@ -235,7 +242,7 @@ await env.withSecurityRulesDisabled(async (ctx) => { gone = (await fsMod.getDoc(
 assert.equal(gone, false);
 await env.withSecurityRulesDisabled(async (ctx) => {
   let n = 0;
-  for (const sub of ["hands", "host", "actions", "presence", "joins"]) n += (await fsMod.getDocs(fsMod.collection(ctx.firestore(), "games/high-card/rooms/" + made.code + "/" + sub))).size;
+  for (const sub of ["hands", "host", "actions", "presence", "joins"]) { const q = await fsMod.getDocs(fsMod.collection(ctx.firestore(), "games/high-card/rooms/" + made.code + "/" + sub)); n += q.size; q.forEach((d) => console.log("        left: " + sub + "/" + d.id + " (alice " + aliceUid + ", bob " + B.o.uid + ")")); }
   leftovers = n;
 });
 assert.equal(leftovers, 0, "sub-docs left: " + leftovers);
@@ -245,7 +252,7 @@ ok("host close() deletes the room and every sub-document");
 {
   const H = client("hana"), G = client("gus");
   const m = await H.o.createRoom({ name: "Hana", seats: ["human", "empty"], options: { handSize: 3 } });
-  assert.equal((await G.o.joinRoom(m.code, "Gus")).ok, true);
+  { const jg = await G.o.joinRoom(m.code, "Gus"); assert.equal(jg.ok, true, "gus join: " + jg.message); }
   await until(() => H.snap.seats[1].kind === "human", "gus seated");
   await H.o.start();
   await until(() => G.snap && G.snap.status === "playing" && G.snap.mine, "gus playing");
@@ -355,7 +362,7 @@ ok("host close() deletes the room and every sub-document");
   const H = client("st-host"), G = client("st-guest");
   const m = await H.o.createRoom({ name: "Hana", seats: ["human", "empty"], options: { handSize: 3 } });
   const R = "games/high-card/rooms/" + m.code;
-  assert.equal((await G.o.joinRoom(m.code, "Gus")).ok, true);
+  { const jg = await G.o.joinRoom(m.code, "Gus"); assert.equal(jg.ok, true, "gus join (9): " + jg.message); }
   await until(() => H.snap.seats[1].kind === "human", "gus seated");
   await H.o.start();
   await until(() => G.snap && G.snap.status === "playing" && G.snap.myTurn && G.snap.mine, "gus to act");

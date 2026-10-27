@@ -54,6 +54,18 @@ export const HOST_HEARTBEAT_MS = 15000; // the host
 export const STALE_MS = 130000;         // a player counts as away after this (a missed beat + 10 s slack)
 export const HOST_STALE_MS = 40000;     // must match hostStale() in firestore.rules (a missed host beat + 10 s slack)
 export const TURN_TIMEOUT_MS = 60000;   // an AWAY player's turn waits this long, then a computer takes the seat
+// v2 (2026-10-27) — about ONE room write per turn instead of one per move:
+//  - the host batches moves: the room doc is written when a person (other than
+//    the host) must act next, when the game ends, or HOLD_MS after the first
+//    unsent move; everyone replays the batched moves as "frames".
+//  - a friend's move inside their own turn is answered with ONE write to that
+//    friend's private doc (it carries the new table for them only).
+//  - the host's heartbeat slows to HEARTBEAT_MS while only friends are to act
+//    (the host isn't needed then), and any room write counts as a heartbeat.
+//  - friends only listen to the host's heartbeat, not to each other's.
+export const HOLD_MS = 20000;           // watchers see a batched turn at most this late
+const FRAME_BYTES = 600000;             // keep a batch well under Firestore's 1 MiB doc limit
+const ANSWER_MS = 8000;                 // a move the host hasn't answered in this long = the host may be gone
 const TICK_MS = 5000;
 const NO_NET_MSG = "Online play couldn't load. Check your internet and try again.";
 const TTL_MS = 2 * 24 * 3600 * 1000;    // rules allow at most 3 days ahead
@@ -193,6 +205,17 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
   const waitSince = {};    // host: seat -> when we started waiting on it
   let hostLoad = Promise.resolve();   // a new host's read of the full state
   const now = () => Date.now() + skew;
+  // v2 batching (host): moves not yet in the room doc, and who has seen what.
+  let ver = 0;             // host: version of hostState (room.v = the last version written)
+  let frames = [];         // host: [{v, p: pubJson, t: toAct}] since the last room write
+  let flushedToAct = [];   // host: toAct as last written to the room (the rules check moves against it)
+  let seenV = {};          // host: uid -> newest version that friend has been sent
+  let holdTimer = null, lastFlushAt = 0, hostView = null;
+  const actSeen = {};      // host: uid -> server time of their last move (counts as a heartbeat)
+  // friend side
+  let progress = null;     // {v, pub, toAct}: my own move answered in my private doc, newer than the room
+  let replay = null, replayTimer = null, shownV = -1, roomSeen = false;
+  let pendingActAt = 0, lastActAt = 0, lastHandAt = 0, busySince = 0;
 
   // ------------------------------------------------------------ setup
   async function ready() {
@@ -258,8 +281,19 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     join: (uid) => F.doc(db, "games", gameId, "rooms", code, "joins", uid),
   };
   const expireAt = () => F.Timestamp.fromMillis(Date.now() + TTL_MS);
-  const isOnline = (uid) => !!uid && presence[uid] != null && now() - presence[uid] < STALE_MS;
-  const hostHere = () => !!room && presence[room.hostUid] != null && now() - presence[room.hostUid] < HOST_STALE_MS;
+  const seenAt = (uid) => Math.max(presence[uid] || 0, actSeen[uid] || 0);
+  const isOnline = (uid) => !!uid && seenAt(uid) > 0 && now() - seenAt(uid) < STALE_MS;
+  // Last sign of the host: its heartbeat, any room write (updatedAt), or an answer to my move.
+  const hostSeen = () => (room ? Math.max(presence[room.hostUid] || 0, tsMillis(room.updatedAt), lastHandAt) : 0);
+  /** Is the table waiting on the host's browser (lobby, its own seat, a computer, an away seat)? */
+  function hostBusy(toAct) {
+    if (!room) return false;
+    if (room.status === "lobby") return true;
+    if (room.status !== "playing") return false;
+    const hs = room.seatUids.indexOf(room.hostUid);
+    return (toAct || []).some((i) => i === hs || !room.seats[i] || room.seats[i].kind !== "human");
+  }
+  const hostHere = () => !!room && now() - hostSeen() < (hostBusy(viewToAct()) ? HOST_STALE_MS : STALE_MS);
   const mySeat = () => (room ? room.seatUids.indexOf(me) : -1);
   // A seat a computer is playing for its owner (who can take it back: reclaim()).
   const isAuto = (s) => !!(s && s.kind === "computer" && s.uid);
@@ -273,31 +307,85 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
   };
 
   // ------------------------------------------------------------ snapshot
+  /**
+   * The table as this player should see it now:
+   *  host: its own full state (it is always up to date);
+   *  friend: a batched move being replayed, or my own answered move, or the room.
+   */
+  const parse = (j) => { try { return JSON.parse(j || "null"); } catch (e) { return null; } };
+  function view() {
+    if (actingHost && hostState && room && room.status !== "lobby") {
+      const seat = mySeat();
+      if (!hostView || hostView.v !== ver || hostView.seat !== seat) {
+        // copies, so a screen that edits what it's given can't touch the real state
+        const over = !!game.isOver(hostState);
+        hostView = { v: ver, seat, pj: JSON.stringify(game.publicView(hostState) ?? null), toAct: over ? [] : game.toAct(hostState).slice(), over,
+          mj: seat >= 0 ? JSON.stringify(game.privateView(hostState, seat) ?? null) : "null" };
+      }
+      return hostView;
+    }
+    if (replay) return replay.cur;
+    if (progress && progress.v > (room.v || 0)) return progress;
+    return { v: room.v, pj: room.pubJson, toAct: room.toAct || [] };
+  }
+  const viewToAct = () => (room ? view().toAct || [] : []);
   function snapshot() {
     const seat = mySeat();
     if (!room || (joinPending && seat < 0)) return { mode: "online", status: joinPending ? "joining" : "none", code, askingHost, error: lastError };
-    let pub = null;
-    try { pub = JSON.parse(room.pubJson || "null"); } catch (e) {}
-    const toAct = room.toAct || [];
     const isHost = room.hostUid === me;
+    const vw = view();
+    const toAct = (vw.toAct || []).slice();
+    let status = room.status;
+    if (vw.over) status = "finished";
+    else if (replay || (vw === progress && status === "finished")) status = "playing";
+    // Friends no longer hear each other's heartbeats (quota): only the host's and their own.
+    const knows = (uid) => actingHost || uid === room.hostUid || uid === me;
     return {
-      mode: "online", code, status: room.status,
-      seats: room.seats.map((s) => ({ kind: s.kind, name: s.name, online: s.kind === "computer" || (s.kind === "human" && isOnline(s.uid)), isHost: s.uid === room.hostUid && !!s.uid, open: !!s.open, auto: isAuto(s) })),
+      mode: "online", code, status,
+      seats: room.seats.map((s) => ({ kind: s.kind, name: s.name, online: s.kind === "computer" || (s.kind === "human" && (uid0(s.uid) === me || (knows(s.uid) ? isOnline(s.uid) || (s.uid === room.hostUid && hostHere()) : true))), isHost: s.uid === room.hostUid && !!s.uid, open: !!s.open, auto: isAuto(s) })),
       mySeat: seat, isHost,
       hostAway: room.hostUid !== me && !hostHere(),
       options: room.options || {},
-      pub, mine: seat >= 0 ? mine : null, toAct, myTurn: seat >= 0 && toAct.includes(seat) && !myAuto(),
+      // parsed fresh each time (a screen may edit what it's given)
+      pub: parse(vw.pj), mine: seat >= 0 ? (vw === hostView ? parse(vw.mj) : mine) : null,
+      toAct, myTurn: !replay && seat >= 0 && toAct.includes(seat) && !myAuto(),
       autoPlay: myAuto(),
       seatRequests: isHost ? requests.map(({ uid, name, seat: s, seatName }) => ({ uid, name, seat: s, seatName })) : [],
-      v: room.v, error: lastError,
+      v: vw.v != null ? vw.v : room.v, error: lastError,
     };
   }
+  const uid0 = (u) => u || "-";
   // Hold the event until my private doc has caught up with the room version,
   // so a UI never shows the new table with the old hand.
   const changed = () => {
-    if (room && room.hv && room.hv[me] > myHandV && room.uids.includes(me)) return;
+    if (!actingHost && room && room.hv && room.hv[me] > myHandV && room.uids.includes(me)) return;
     ev.emit("change", snapshot());
   };
+
+  // ------------------------------------------------------------ replay (friends)
+  /** A room write that carries batched moves: show them one by one, then the table. */
+  function roomArrived() {
+    if (actingHost || !room) return;
+    if (!roomSeen) { roomSeen = true; shownV = room.v || 0; return; }     // just joined: no old moves
+    if ((room.v || 0) <= shownV) return;
+    if (pendingActAt && (room.v || 0) > 0) pendingActAt = 0;
+    const fr = (room.frames || []).filter((f) => f && f.v > shownV && f.v < room.v);
+    shownV = room.v;
+    if (!fr.length) { if (replay) { clearTimeout(replayTimer); replay = null; } return; }
+    const queue = (replay ? replay.queue : []).concat(fr.map((f) => ({ v: f.v, pj: f.p, toAct: f.t || [] })));
+    const pace = Math.max(120, Math.min(botDelayMs, Math.floor(4000 / queue.length)));
+    if (!replay) { replay = { queue, cur: queue.shift(), pace }; nextFrame(); }
+    else Object.assign(replay, { queue, pace });
+  }
+  function nextFrame() {
+    replayTimer = setTimeout(() => {
+      if (!replay) return;
+      if (replay.queue.length) { replay.cur = replay.queue.shift(); nextFrame(); }
+      else replay = null;
+      changed();
+    }, replay.pace);
+  }
+  function stopReplay() { clearTimeout(replayTimer); replay = null; replayTimer = null; }
   const fail = (e) => { lastError = humanError(e); ev.emit("error", lastError); changed(); return { ok: false, message: lastError }; };
 
   // ------------------------------------------------------------ cleanup
@@ -454,8 +542,10 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
         detach();
         return;
       }
-      if (room.hostUid === me && !actingHost) becomeHost();
+      if (room.hostUid === me && !actingHost) { stopReplay(); becomeHost(); }
       else if (room.hostUid !== me && actingHost) stopHost();
+      if (member) listenPresence();
+      roomArrived();
       if (actingHost) scheduleBots();
       autoChanged();
       changed();
@@ -489,21 +579,16 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
       const h = d.data();
       try { mine = JSON.parse(h.json); } catch (e) { mine = null; }
       myHandV = h.v;
+      // v2: the host answered my move in my private doc (the room is written later).
+      if (typeof h.pub === "string" && room && h.v > (room.v || 0)) {
+        progress = { v: h.v, pj: h.pub, toAct: h.toAct || [] };
+        shownV = Math.max(shownV, h.v);
+        lastHandAt = now(); pendingActAt = 0;
+        if (replay) stopReplay();
+      }
       changed();
     }, () => {}));
-    subs.push(F.onSnapshot(P.presence(), (snap) => {
-      presence = {};
-      snap.forEach((d) => {
-        const at = d.data().at;
-        if (!at || !at.toMillis) return;
-        presence[d.id] = at.toMillis();
-        // Our own beat came back with the server's time: learn how far our clock is off.
-        if (d.id === me && beatSentAt && !(d.metadata && d.metadata.hasPendingWrites)) { skew = at.toMillis() - beatSentAt; beatSentAt = 0; }
-      });
-      checkHost();
-      if (actingHost) idleCheck();
-      changed();
-    }, () => {}));
+    listenPresence();
     lastTick = Date.now();
     staleTimer = setInterval(() => {
       // A long gap between ticks = this device slept (laptop lid, locked phone).
@@ -519,22 +604,69 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
   }
   let tickSig = "";
 
+  /**
+   * Heartbeats in: the host hears everyone (away players, online dots); a
+   * friend hears only the host (to notice a lost host), plus its own beat once
+   * to learn how far its clock is off. Each beat costs a read per listener.
+   */
+  let presSub = null, presKey = "", skewSub = null;
+  function onPres(d) {
+    const at = d.exists() && d.data().at;
+    if (!at || !at.toMillis) return false;
+    presence[d.id] = at.toMillis();
+    // Our own beat came back with the server's time: learn how far our clock is off.
+    if (d.id === me && beatSentAt && !(d.metadata && d.metadata.hasPendingWrites)) { skew = at.toMillis() - beatSentAt; beatSentAt = 0; return true; }
+    return false;
+  }
+  const presChanged = () => { checkHost(); if (actingHost) idleCheck(); changed(); };
+  function listenPresence() {
+    if (!memberSubs || !room) return;
+    const key = actingHost ? "*" : room.hostUid;
+    if (key === presKey) return;
+    if (presSub) { try { presSub(); } catch (e) {} }
+    presKey = key;
+    if (key === "*") {
+      presSub = F.onSnapshot(P.presence(), (snap) => { presence = {}; snap.forEach(onPres); presChanged(); }, () => {});
+    } else {
+      presence = {};
+      presSub = F.onSnapshot(P.pres(key), (d) => { onPres(d); presChanged(); }, () => {});
+      if (!skewSub && key !== me) {
+        skewSub = F.onSnapshot(P.pres(me), (d) => { if (onPres(d) && skewSub) { const u = skewSub; skewSub = true; u(); } }, () => {});
+      }
+    }
+  }
+  function stopPresence() {
+    for (const u of [presSub, skewSub]) if (typeof u === "function") { try { u(); } catch (e) {} }
+    presSub = null; skewSub = null; presKey = "";
+  }
+
   // ------------------------------------------------------------ presence
+  let beatP = Promise.resolve();   // close() waits for a beat in flight, so it can't land after the clean-up
+  let closing = false;             // close() is deleting the room: no more beats
   function beat() {
-    if (!code || !me || (globalThis.document && document.visibilityState === "hidden")) return;
+    if (closing || !code || !me || (globalThis.document && document.visibilityState === "hidden")) return;
     lastBeat = Date.now();
     beatSentAt = lastBeat;
-    F.setDoc(P.pres(me), { at: F.serverTimestamp(), expireAt: expireAt() }).catch(() => {});
+    beatP = F.setDoc(P.pres(me), { at: F.serverTimestamp(), expireAt: expireAt() }).catch(() => {});
   }
   function startHeartbeat() {
     if (heartbeat) return;
     beat();
-    // The host beats every 10 s, everyone else every 25 s (free-quota writes).
-    heartbeat = setInterval(() => { if (Date.now() - lastBeat >= (actingHost ? HOST_HEARTBEAT_MS : HEARTBEAT_MS) - 500) beat(); }, TICK_MS);
+    // Free-quota writes: the host beats every 15 s while the table waits on it
+    // (lobby, its turn, a computer's turn) and every 60 s while only friends
+    // are to act; a room write counts as a beat. A friend beats every 60 s,
+    // and a move it sent counts as a beat.
+    heartbeat = setInterval(() => {
+      const every = actingHost && hostBusy(viewToAct()) ? HOST_HEARTBEAT_MS : HEARTBEAT_MS;
+      const last = Math.max(lastBeat, actingHost ? lastFlushAt : lastActAt);
+      if (Date.now() - last >= every - 500) beat();
+    }, TICK_MS);
     if (globalThis.document) document.addEventListener("visibilitychange", onVisible);
   }
   function onVisible() {
     if (document.visibilityState === "visible" && code && me && room) { beat(); cameBack(); }
+    // Phone locked / tab hidden: send any batched moves now, the page may not come back.
+    else if (document.visibilityState === "hidden" && actingHost && frames.length) flush();
   }
 
   /** This page is back (visible again, reloaded, or woke up): if a computer took our seat, take it back. */
@@ -586,13 +718,20 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
   /** If the host has gone quiet, the lowest online human seat takes over. */
   function checkHost() {
     if (!room || room.hostUid === me || room.status === "closed" || !room.uids.includes(me)) return;
-    if (hostHere() || presence[room.hostUid] == null && now() - tsMillis(room.updatedAt) < HOST_STALE_MS) { clearTimeout(claimTimer); claimTimer = null; return; }
+    // v2: only take over when the table actually waits on the host (its turn, a
+    // computer's, the lobby, or a move of mine it hasn't answered) for 10 s and
+    // the host's last sign of life is over 40 s old. While only friends are to
+    // act the host beats slowly and that is fine.
+    const busy = hostBusy(viewToAct()) || (pendingActAt && now() - pendingActAt > ANSWER_MS);
+    if (busy && !busySince) busySince = Date.now();
+    if (!busy) busySince = 0;
+    if (!busy || Date.now() - busySince < 10000 || now() - hostSeen() < HOST_STALE_MS) { clearTimeout(claimTimer); claimTimer = null; return; }
     if (claimTimer) return;
-    const order = room.seatUids.filter((u) => u && u !== room.hostUid && (u === me || isOnline(u)));
+    const order = room.seatUids.filter((u) => u && u !== room.hostUid && (u === me || !actSeen[u] || isOnline(u)));
     const rank = Math.max(0, order.indexOf(me));
     claimTimer = setTimeout(async () => {
       claimTimer = null;
-      if (!room || room.hostUid === me || hostHere()) return;
+      if (!room || room.hostUid === me || now() - hostSeen() < HOST_STALE_MS) return;
       const old = room.hostUid;
       try {
         await F.runTransaction(db, async (tx) => {
@@ -608,23 +747,36 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
   async function becomeHost() {
     actingHost = true;
     lastHand = {};
+    frames = []; seenV = {}; hv = {}; ver = room.v || 0; flushedToAct = (room.toAct || []).slice(); hostView = null;
+    progress = null;
+    listenPresence();
     for (const k of Object.keys(waitSince)) delete waitSince[k];
     if (heartbeat && Date.now() - lastBeat > 5000) beat();   // a new host's last beat may be 60 s old: refresh it now
     if (room.status !== "lobby" && !hostState) {
       // A move tapped while the table loads waits for it (act awaits hostLoad).
-      hostLoad = F.getDoc(P.hostDoc()).then((s) => { if (s.exists() && actingHost) hostState = JSON.parse(s.data().s); }, (e) => { fail(e); });
+      // (3 tries: a dropped read must not leave the new host without a table.)
+      hostLoad = (async () => {
+        for (let i = 0; i < 3 && actingHost && !hostState; i++) {
+          try { const s = await F.getDoc(P.hostDoc()); if (s.exists() && actingHost) hostState = JSON.parse(s.data().s); return; }
+          catch (e) { if (i === 2) fail(e); else await new Promise((r) => setTimeout(r, 1000)); }
+        }
+      })();
       await hostLoad;
     }
     hostSubs.push(F.onSnapshot(P.joins(), (snap) => { joinsSnap = snap; processJoins(); }, () => {}));
     hostSubs.push(F.onSnapshot(P.actions(), (snap) => { processActions(snap); }, () => {}));
     // A migrated host re-publishes so every hand doc is current again.
-    if (hostState && room.status === "playing") publish().then(scheduleBots);
+    if (hostState && room.status === "playing") { stepped(); flush().then(scheduleBots); }
     else scheduleBots();
+    changed();
   }
   function stopHost() {
+    const was = actingHost;
     for (const u of hostSubs) { try { u(); } catch (e) {} }
-    hostSubs = []; actingHost = false; hostState = null; joinsSnap = null;
+    hostSubs = []; actingHost = false; hostState = null; joinsSnap = null; hostView = null;
     clearTimeout(botTimer); botTimer = null;
+    clearTimeout(holdTimer); holdTimer = null; frames = [];
+    if (was && room) { roomSeen = true; shownV = room.v || 0; listenPresence(); }
     handled.clear();          // a later spell as host re-reads any notes still waiting
     if (requests.length) { requests = []; renderPrompt(); }
   }
@@ -697,7 +849,7 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     const upd = { seats, seatUids: seats.map((s) => s.uid), uids };
     if (room.status === "playing" && hostState) {
       room = Object.assign({}, room, upd);
-      await publish(upd);
+      await flush(upd);
     } else {
       await F.updateDoc(P.room(code), Object.assign({ updatedAt: F.serverTimestamp(), expireAt: expireAt() }, upd));
       room = Object.assign({}, room, upd);
@@ -787,11 +939,14 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
       const docs = snap.docs.slice().sort((a, b) => tsMillis(a.data().at) - tsMillis(b.data().at));
       let moved = false;
       let extra = null;
+      const actors = new Set();
       for (const d of docs) {
         const x = d.data();
+        if (x.by && tsMillis(x.at)) actSeen[x.by] = Math.max(actSeen[x.by] || 0, tsMillis(x.at));
         if (room.seatUids[x.seat] === x.by) {
           try {
             hostState = step(game, hostState, x.seat, x.a, rng); moved = true;
+            stepped(); actors.add(x.by);
             delete waitSince[x.seat];
             // A move from the owner of a computer-played seat = they're back.
             if (isAuto(room.seats[x.seat])) {
@@ -804,7 +959,7 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
         }
         await F.deleteDoc(d.ref).catch(() => {});
       }
-      if (moved) await publish(extra || {});
+      if (moved) { changed(); await settle(extra, actors); }
     } catch (e) { fail(e); }
     finally {
       processing = false;
@@ -813,29 +968,87 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     }
   }
 
-  /** Host: write the public view, changed private hands and the full state in one batch. */
-  async function publish(extra = {}) {
+  /** Host: the state just moved on — remember the new table as a frame for the replay. */
+  function stepped() {
+    ver = Math.max(ver, room.v || 0) + 1;
+    hostView = null;
+    const over = !!game.isOver(hostState);
+    frames.push({ v: ver, p: JSON.stringify(game.publicView(hostState) ?? null), t: over ? [] : game.toAct(hostState) });
+    let bytes = frames.reduce((n, f) => n + f.p.length, 0);
+    while (frames.length > 1 && (bytes > FRAME_BYTES || frames.length > 150)) bytes -= frames.shift().p.length;   // drop the oldest frames, never the table (rules allow 200)
+  }
+
+  /**
+   * Host: after moves, decide who must hear about them NOW.
+   *  - the game ended, seats changed, or a person must act who the room
+   *    doesn't list yet (the rules check moves against the room) → write the room;
+   *  - else friends who must act (or who just moved) and haven't seen this
+   *    version: two or more → write the room; exactly one → write only that
+   *    friend's private doc, with the new table inside (1 write);
+   *  - else hold the moves; the room is written within HOLD_MS for watchers.
+   */
+  async function settle(extra, actors) {
     if (!actingHost || !hostState || !room) return;
+    if (extra || game.isOver(hostState)) return flush(extra || {});
+    const toAct = game.toAct(hostState);
+    const hs = mySeat();
+    const person = (i) => room.seats[i] && room.seats[i].kind === "human" && room.seats[i].uid;
+    if (toAct.some((i) => person(i) && i !== hs && !flushedToAct.includes(i))) return flush();
+    const need = new Set();
+    for (const i of toAct) if (person(i) && i !== hs && (seenV[room.seats[i].uid] || 0) < ver) need.add(room.seats[i].uid);
+    for (const u of actors || []) if (u !== me && room.uids.includes(u) && (seenV[u] || 0) < ver) need.add(u);
+    if (need.size > 1) return flush();
+    if (need.size === 1) await sendProgress([...need][0]);
+    hold();
+  }
+  function hold() {
+    if (holdTimer || !frames.length) return;
+    holdTimer = setTimeout(() => { holdTimer = null; if (frames.length) flush(); }, HOLD_MS);
+  }
+
+  /** Host: one write to one friend's private doc — their hand plus the table as it is now. */
+  async function sendProgress(uid) {
+    const i = room.seatUids.indexOf(uid);
+    if (i < 0) return;
+    const json = JSON.stringify(game.privateView(hostState, i) ?? null);
+    const over = !!game.isOver(hostState);
+    seenV[uid] = ver;
+    lastHand[uid] = json;
+    hv[uid] = ver;
+    try {
+      await F.setDoc(P.hand(uid), { json, v: ver, pub: JSON.stringify(game.publicView(hostState) ?? null), toAct: over ? [] : game.toAct(hostState), expireAt: expireAt() });
+    } catch (e) { delete lastHand[uid]; fail(e); }
+  }
+  let hv = {};             // host: uid -> version of the hand doc last written
+
+  /** Host: write the room (public view + batched frames), changed private hands and the full state in one batch. */
+  async function flush(extra = {}) {
+    if (!actingHost || !hostState || !room) return;
+    clearTimeout(holdTimer); holdTimer = null;
+    if (ver <= (room.v || 0)) ver = (room.v || 0) + 1;
+    const v = ver;
     const over = !!game.isOver(hostState);
     const toAct = over ? [] : game.toAct(hostState);
-    const v = (room.v || 0) + 1;
-    const hv = Object.assign({}, room.hv || {});
+    hv = Object.assign({}, room.hv || {}, hv);
     const b = F.writeBatch(db);
     room.seats.forEach((s, i) => {
       if (!s.uid) return;     // a human, or a computer playing for its owner (who still sees the hand)
       const json = JSON.stringify(game.privateView(hostState, i) ?? null);
+      seenV[s.uid] = v;
       if (lastHand[s.uid] === json) return;
       lastHand[s.uid] = json;
       hv[s.uid] = v;
       b.set(P.hand(s.uid), { json, v, expireAt: expireAt() });
     });
     b.set(P.hostDoc(), { s: JSON.stringify(hostState), v, expireAt: expireAt() });
+    const sent = frames.filter((f) => f.v < v);
     const upd = Object.assign({}, extra, {
-      pubJson: JSON.stringify(game.publicView(hostState) ?? null), toAct, v, hv,
+      pubJson: JSON.stringify(game.publicView(hostState) ?? null), toAct, v, hv: Object.assign({}, hv), frames: sent,
       status: over ? "finished" : "playing", updatedAt: F.serverTimestamp(), expireAt: expireAt(),
     });
     b.update(P.room(code), upd);
     room = Object.assign({}, room, upd);
+    frames = []; flushedToAct = toAct.slice(); lastFlushAt = Date.now();
     try { await b.commit(); } catch (e) { lastHand = {}; fail(e); }
   }
 
@@ -878,8 +1091,10 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
         for (const s of bots) {
           if (game.isOver(hostState) || !game.toAct(hostState).includes(s)) continue;
           hostState = step(game, hostState, s, game.bot(botCtx(game, hostState, s), s, rng), rng);
+          stepped();
         }
-        await publish();
+        changed();
+        await settle(null, null);
       } catch (e) { fail(e); }
       scheduleBots();
     }, botDelayMs);
@@ -934,7 +1149,9 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
       if (game.minSeats && seats.length < game.minSeats) throw new Error("Needs at least " + game.minSeats + " seats.");
       hostState = game.setup(seats.length, opts, rng, seats.map((s) => ({ kind: s.kind, name: s.name })));
       room = Object.assign({}, room, { seats, seatUids: seats.map((s) => s.uid), options: opts, status: "playing" });
-      await publish({ seats, seatUids: room.seatUids, options: opts });
+      frames = []; hostView = null;
+      await flush({ seats, seatUids: room.seatUids, options: opts });
+      changed();
       scheduleBots();
       return { ok: true };
     } catch (e) { return fail(e); }
@@ -945,26 +1162,29 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     if (!room) return fail(new Error("Not in a game."));
     const seat = mySeat();
     if (seat < 0) return fail(new Error("You don't have a seat."));
-    if (!(room.toAct || []).includes(seat)) return fail(new Error("Not your turn."));
+    if (!viewToAct().includes(seat)) return replay ? { ok: false, stale: true, message: STALE_MSG } : fail(new Error("Not your turn."));
     if (actingHost && !hostState) await hostLoad;   // just took over: the table is still loading
     if (actingHost) {
       if (!hostState) return { ok: false, stale: true, message: STALE_MSG };
       try { hostState = step(game, hostState, seat, action, rng); }
       catch (e) { return fail(e); }
+      stepped();
       delete waitSince[seat];
-      let extra = {};
+      let extra = null;
       if (isAuto(room.seats[seat])) {
         const seats = clone(room.seats);
         seats[seat] = { kind: "human", name: ownName(seats[seat]), uid: me };
         extra = { seats, seatUids: seats.map((s) => s.uid) };
         room = Object.assign({}, room, extra);
       }
-      await publish(extra);
+      changed();
+      await settle(extra, null);
       scheduleBots();
       return { ok: true };
     }
     try {
       await F.addDoc(P.actions(), { by: me, seat, a: clone(action), at: F.serverTimestamp(), expireAt: expireAt() });
+      pendingActAt = now(); lastActAt = Date.now();
       return { ok: true };
     } catch (e) {
       // Our copy of the table was one update behind (it was no longer this
@@ -982,6 +1202,7 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
     if (!room || !code) { await detach(); return { ok: true }; }
     try {
       if (actingHost) {
+        if (frames.length && room.status === "playing") await flush();   // batched moves first
         const others = room.seats.filter((s) => s.kind === "human" && s.uid && s.uid !== me && isOnline(s.uid));
         if (!others.length || room.status !== "playing") return await close();
         const seats = clone(room.seats);
@@ -1008,17 +1229,22 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
       const c = code;
       // Everyone who ever got a hand (hv), not just who is seated now.
       const uids = [...new Set(room.seats.map((s) => s.uid).filter(Boolean).concat(Object.keys(room.hv || {})))];
+      closing = true;
       stopHost();
       stopTimers();
+      await beatP;
       for (const u of uids) await F.deleteDoc(F.doc(db, "games", gameId, "rooms", c, "hands", u)).catch(() => {});
       for (const sub of ["actions", "presence", "joins"]) {
         try { const s = await F.getDocs(F.collection(db, "games", gameId, "rooms", c, sub)); for (const d of s.docs) await F.deleteDoc(d.ref).catch(() => {}); } catch (e) {}
       }
+      // getDocs can miss our own latest beat (it may answer from our listener's view): delete it by name.
+      await F.deleteDoc(F.doc(db, "games", gameId, "rooms", c, "presence", me)).catch(() => {});
       await F.deleteDoc(F.doc(db, "games", gameId, "rooms", c, "host", "state")).catch(() => {});
       await F.deleteDoc(P.room(c));
-    } catch (e) { return fail(e); }
+    } catch (e) { closing = false; return fail(e); }
     store.del(RESUME_KEY);
     await detach();
+    closing = false;
     return { ok: true };
   }
 
@@ -1031,8 +1257,10 @@ export function createOnline({ game, gameId = game && game.id, config = FIREBASE
   async function detach() {
     for (const u of subs) { try { u(); } catch (e) {} }
     subs = []; memberSubs = false;
+    stopPresence(); stopReplay();
     stopHost(); stopTimers(); watchTaps(false);
     room = null; mine = null; code = null; presence = {}; joinPending = false; askingHost = false; myHandV = -1;
+    progress = null; shownV = -1; roomSeen = false; pendingActAt = 0; lastHandAt = 0; busySince = 0;
   }
 
   return {

@@ -125,11 +125,12 @@ table with the old hand.
 | Room code | 5 characters, no O/0/I/1. Rooms can be fetched by code, never listed. |
 | Join | Joiner leaves a note; the host's browser seats them in the first empty seat. Mid-game, the same login walks straight back into its seat; a **different** login typing an offline player's name needs the host's Allow (or an open seat). Only the host can write who sits where (rules-tested). |
 | Moves | Host's own moves apply instantly. Others write a move doc; rules only accept it for **your seat, when your seat is in `toAct`**; the host applies it with your `apply` (illegal = dropped). |
+| Batching (v2) | The host does **not** write the room after every move. Each move becomes a frame `{v, p, t}`; the room (with `frames`, up to 200) is written only when the game ends, seats change, a person other than the host newly has to act (the rules check `toAct` on the room), 2+ friends need news, or 20 s pass. If exactly one friend is waiting on news, the host writes only that friend's `hands/{uid}` doc, with `pub` + `toAct` added. Friends replay the frames one by one (computer moves still look step by step). Watchers may see other players' moves up to 20 s late. |
 | Computers | Run in the host's browser, one step every `botDelayMs`. |
 | Hidden info | `hands/{uid}` — only that uid can read it (rules-tested). The host's browser holds the full state (no free server can avoid that; accepted, same as Cribbage). |
-| Presence | Heartbeat while the tab is visible: the host every 15 s, players every 60 s. A player is "offline" after 130 s, the host after 40 s. |
+| Presence | Heartbeat while the tab is visible: the host every 15 s **only while the table waits on the host** (lobby, its own turn, a computer's turn), otherwise every 60 s; players every 60 s. A room write counts as a host beat, a sent move as a player's beat. Friends listen only to the host's presence doc (not the whole collection). A player is "offline" after 130 s, the host after 40 s. |
 | Away on your turn | If the table waits on a player who is **offline** for the turn timeout (default **60 s**, room option `turnTimeoutSec`, `0` = never), the host's browser lets a computer play that seat (`seats[i].auto`). The seat stays theirs: when their phone comes back (reload, rejoin, screen on, or any tap) it's handed back. Players who are online are never hurried. |
-| Host leaves | `leave()` hands hosting to another online player. If the host just vanishes, after 40 s without a host heartbeat the lowest online seat takes over (rules check the old heartbeat really is stale); measured 43 s on the emulator (was ~75–85 s). One missed beat (a 25 s blip) does not trigger it. The new host reloads the full state and carries on. |
+| Host leaves | `leave()` hands hosting to another online player. If the host just vanishes, the lowest online seat takes over once the table waits on the host (≥10 s) and the host has shown no sign for 40 s (beat, room write or answer); the rules check both the presence doc and the room's `updatedAt` are over 40 s old. Measured 43 s on the emulator. One missed beat does not trigger it. The new host reloads the full state (3 tries) and carries on; moves batched but not yet saved by the old host are lost (at most ~20 s of play). |
 | Reload | `resume()` reattaches (anonymous login persists in the browser). |
 | Cleanup | `close()` deletes everything. Abandoned rooms: every doc has `expireAt` (2 days ahead, refreshed on each write; rules refuse more than 3). Firestore TTL needs billing, so instead **the rules let anyone list and delete only expired docs**, and `createRoom` sweeps up to 25 expired docs per collection (at most once per 6 h per browser). |
 
@@ -138,14 +139,29 @@ table with the old hand.
 Spark plan per day: **50,000 reads, 20,000 writes, 20,000 deletes**, 1 GiB stored. If it runs out,
 online play stops until midnight Pacific (the error says so) — **it never costs money** (no billing account).
 
-Measured costs (`test/online.test.mjs` counts every SDK call; it's an estimate because rule `get()`s add
-about 1 read per write): starting a 3-seat game = 6 writes; one full 3-seat round (host pick, guest pick, computer
-pick, reveal) = 6 writes + 6 reads across all clients. As a rule of thumb, a host or computer move ≈ 2–3 writes
-(room, full state, changed hands) and a guest move ≈ +1 write and +1 delete (the move doc).
-Heartbeats: host 1 write per 15 s visible (240/hour), each other player 1 write per 60 s (60/hour), and each beat is 1 read for every member. A 2-player room: 300 writes + 600 reads an hour (was 288 + 576); 3 players: 360 + 1,080 (was 432 + 1,296); 4 players: 420 + 1,680 (was 576 + 2,304).
+**Measured per game (v2, 2026-10-27)** with `test/cost.mjs`: every game's real engine, a host plus 1–2
+friends thinking 2–10 s per move, the other seats computers, on a billing fake (`test/fakefs.mjs`) that
+counts like Firestore (listener reads per changed doc, rule `get()`s, deletes). Checked against the real
+emulator with `test/emu-cost.mjs` (High Card: fake 51 writes, emulator 48–51).
 
-Rough capacity: **a 4-player 45-minute game ≈ 1,000–1,500 writes**, so ~15 such games a day across all
-sites. Keep games under it:
+| Game (one full game) | Writes before → v2 | Reads before → v2 |
+|---|---|---|
+| Catan | 948 → 507 | 2,084 → 1,120 |
+| Hearts | 2,775 → 1,704 | 6,038 → 3,544 |
+| Risk | 2,014 → 982 | 4,861 → 2,356 |
+| Monopoly | 1,293 → 790 | 3,274 → 1,915 |
+| Hold'em | 1,206 → 532 | 2,698 → 1,220 |
+| Coup | 385 → 184 | 788 → 409 |
+| Ticket to Ride | 844 → 470 | 1,869 → 1,054 |
+| Codenames | 124 → 70 | 320 → 189 |
+| Bank (4 seats, 3 people) | 552 → 440 | 1,349 → 1,007 |
+
+All 26 games: about **−38% writes and reads** (Bank only −20%: everyone may bank at any moment, so nearly every roll must reach every phone). What's left: a friend's move = 2 writes (the move + the
+host's answer) + 1 delete; a room write ≈ 2–3 writes (room + full state + changed hands).
+A busy day (300 players, 50 at once, spread over all games) ≈ **47K writes / 105K reads** (was 75K / 169K):
+still over the free quota, so a busy day can stop online play until midnight Pacific (never costs money).
+
+Keep games under it:
 - Don't publish animation steps — publish **one state per move**; animate client-side from the diff.
 - Keep `privateView` stable (sorted hands, no timestamps/counters that change every move).
 - Prefer one action per decision (e.g. "pass these 3 cards" not 3 separate moves).
@@ -165,6 +181,16 @@ sites. Keep games under it:
 - The security rules are tested once, here (`cd test && npm test`). Games don't redo it.
 
 ## Changelog
+
+- **2026-10-27 (v2) — about one room write per turn. Re-copy `online.js`.** The host batches moves
+  into frames and writes the room only when someone else must act, seats change, the game ends or
+  20 s pass; a single waiting friend gets news in their own hand doc instead. Heartbeats: the host
+  slows to 60 s while only friends are thinking; friends listen to the host's presence doc only.
+  Takeover waits until the table waits on the host and the host has been silent 40 s. `close()`
+  can no longer leave the host's own presence doc behind. Rules (deployed): room `frames` (≤200),
+  hand `pub`/`toAct`, takeover also needs the room's `updatedAt` over 40 s old. The API and snapshot
+  shape are unchanged; old and new copies can share the project (an old host simply writes more).
+  **Every game: copy the new `online.js` over your `js/online.js` unchanged.**
 
 - **2026-10-27 — away players, seat reclaim, faster host takeover, no-internet message. Re-copy `online.js`.**
   (1) A player who is offline when the table waits on them gets a computer in their seat after the
@@ -203,6 +229,8 @@ sites. Keep games under it:
 | `online.js` | the module (copy this) |
 | `firestore.rules`, `firestore.indexes.json` (sweep indexes), `firebase.json` | deployed to `th-board-games` (anonymous auth on) |
 | `test/real-smoke.mjs` | 2 clients play a full game on the REAL project (node) |
+| `test/v2.test.mjs`, `test/fakefs.mjs` | cost/batching checks on a billing fake with a virtual clock (no emulator) |
+| `test/cost.mjs`, `test/emu-cost.mjs` | per-game write/read counts for every game (`node cost.mjs`), and the fake-vs-emulator cross-check |
 | `demo/` | High Card: hidden hands, simultaneous picks, computers, two-browser proof |
 | `test/rules.test.js` | emulator tests of the rules |
 | `test/online.test.mjs` | online.js end-to-end on the emulator (create, join, play, secrecy, host takeover) |

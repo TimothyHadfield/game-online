@@ -26,11 +26,12 @@ const move = (by, seat, extra = {}) => Object.assign({ by, seat, a: { card: 5 },
     // RULES_FILE lets you point the suite at broken rules to prove it catches them.
     firestore: { rules: fs.readFileSync(process.env.RULES_FILE || path.join(__dirname, "..", "firestore.rules"), "utf8"), host: "127.0.0.1", port: 8090 },
   });
+  // hostAt = the host's last heartbeat; its last room write is just as old unless roomPatch says otherwise.
   async function seed(roomPatch = {}, hostAt = Timestamp.now()) {
     await env.clearFirestore();
     await env.withSecurityRulesDisabled(async (ctx) => {
       const db = ctx.firestore();
-      await setDoc(doc(db, R), Object.assign(ROOM(), roomPatch));
+      await setDoc(doc(db, R), Object.assign(ROOM(), { updatedAt: hostAt }, roomPatch));
       await setDoc(doc(db, R + "/hands/alice"), { json: "[1,2]", v: 1, expireAt: soon() });
       await setDoc(doc(db, R + "/hands/bob"), { json: "[40,41]", v: 1, expireAt: soon() });
       await setDoc(doc(db, R + "/host/state"), { s: "{secret}", v: 1, expireAt: soon() });
@@ -110,6 +111,11 @@ const move = (by, seat, extra = {}) => Object.assign({ by, seat, a: { card: 5 },
   await check("bob TAKES the host when alice's heartbeat is 45 s old", assertSucceeds(updateDoc(doc(as("bob"), R), { hostUid: "bob" })));
   await seed({}, Timestamp.fromMillis(Date.now() - 25e3));
   await check("bob CANNOT take the host after a 25 s blip (one missed beat)", assertFails(updateDoc(doc(as("bob"), R), { hostUid: "bob" })));
+  // 2026-10-27 v2: a room write counts as a host heartbeat (the host skips beats right after one).
+  await seed({ updatedAt: Timestamp.fromMillis(Date.now() - 5e3) }, Timestamp.fromMillis(Date.now() - 120e3));
+  await check("bob CANNOT take the host when the beat is 2 min old but the room was written 5 s ago", assertFails(updateDoc(doc(as("bob"), R), { hostUid: "bob" })));
+  await seed({ updatedAt: Timestamp.fromMillis(Date.now() - 50e3) }, Timestamp.fromMillis(Date.now() - 120e3));
+  await check("bob TAKES the host when the beat AND the last room write are both old", assertSucceeds(updateDoc(doc(as("bob"), R), { hostUid: "bob" })));
   await seed();
   await check("bob CANNOT delete the room", assertFails(deleteDoc(doc(as("bob"), R))));
 
@@ -149,6 +155,15 @@ const move = (by, seat, extra = {}) => Object.assign({ by, seat, a: { card: 5 },
     b.update(doc(db, R), { pubJson: "{}", toAct: [0], v: 4, hv: { bob: 4 }, status: "playing", updatedAt: serverTimestamp(), expireAt: soon() });
     await check("host's publish batch commits", assertSucceeds(b.commit()));
   }
+  // v2: batched moves ride along as frames; a friend's own move is answered in their hand doc.
+  const frame = (v) => ({ v, p: "{}", t: [1] });
+  await check("host writes the room with batched frames", assertSucceeds(updateDoc(doc(as("alice"), R), { pubJson: "{}", toAct: [1], v: 6, frames: [frame(4), frame(5)], updatedAt: serverTimestamp(), expireAt: soon() })));
+  await check("host CANNOT write more than 200 frames", assertFails(updateDoc(doc(as("alice"), R), { v: 7, frames: Array.from({ length: 201 }, (_, i) => frame(i)), expireAt: soon() })));
+  await check("frames must be a list", assertFails(updateDoc(doc(as("alice"), R), { v: 7, frames: "x", expireAt: soon() })));
+  await check("bob CANNOT write frames", assertFails(updateDoc(doc(as("bob"), R), { frames: [frame(9)] })));
+  await check("host answers bob's move in bob's hand doc (pub + toAct)", assertSucceeds(setDoc(doc(as("alice"), R + "/hands/bob"), { json: "[7]", v: 8, pub: "{}", toAct: [1], expireAt: soon() })));
+  await check("host CANNOT put other fields in a hand doc", assertFails(setDoc(doc(as("alice"), R + "/hands/bob"), { json: "[7]", v: 8, pub: "{}", toAct: [1], x: 1, expireAt: soon() })));
+  await check("bob CANNOT write his own table into his hand doc", assertFails(setDoc(doc(as("bob"), R + "/hands/bob"), { json: "[7]", v: 9, pub: "{}", toAct: [1], expireAt: soon() })));
 
   console.log("Self-cleaning (expired docs only)");
   await seed();

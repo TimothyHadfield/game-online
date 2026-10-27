@@ -21,7 +21,8 @@ rules_version = '2';
 //   5. Every document must expire within 3 days. Expired documents may be
 //      listed and deleted by anyone (online.js sweeps them), because Firestore
 //      TTL policies need a billing account and this project stays on Spark.
-//   6. Host takeover only when the host's heartbeat is over 75 s old.
+//   6. Host takeover only when the host's heartbeat AND its last room write
+//      are both over 40 s old.
 // ============================================================================
 
 service cloud.firestore {
@@ -43,8 +44,9 @@ service cloud.firestore {
         return gameId.matches('^[a-z0-9-]{1,32}$')
             && code.matches('^[A-Z0-9]{4,8}$')
             && d().keys().hasOnly(['gameId', 'hostUid', 'uids', 'seats', 'seatUids', 'status',
-                                   'options', 'pubJson', 'toAct', 'v', 'hv',
+                                   'options', 'pubJson', 'toAct', 'v', 'hv', 'frames',
                                    'createdAt', 'updatedAt', 'expireAt'])
+            && (!('frames' in d()) || (d().frames is list && d().frames.size() <= 200))
             && d().gameId == gameId
             && d().uids is list && d().uids.size() <= 12
             && d().seats is list && d().seats.size() >= 1 && d().seats.size() <= 12
@@ -55,10 +57,13 @@ service cloud.firestore {
             && expiresSoon();
       }
 
-      // Host's heartbeat older than 40 s (or missing) = the host is gone (it beats every 15 s).
+      // The host is gone when its heartbeat (or none) AND its last room write are
+      // both older than 40 s. It beats every 15 s while the table waits on it,
+      // and any room write counts as a beat (online.js v2).
       function hostStale() {
         let p = /databases/$(database)/documents/games/$(gameId)/rooms/$(code)/presence/$(resource.data.hostUid);
-        return !exists(p) || get(p).data.at < request.time - duration.value(40, 's');
+        return (!exists(p) || get(p).data.at < request.time - duration.value(40, 's'))
+            && (!('updatedAt' in resource.data) || resource.data.updatedAt < request.time - duration.value(40, 's'));
       }
 
       allow get:  if signedIn();
@@ -93,7 +98,8 @@ service cloud.firestore {
       match /hands/{handUid} {
         allow get:   if signedIn() && handUid == uid();
         allow list:  if false;
-        allow create, update: if isHost() && d().keys().hasOnly(['json', 'v', 'expireAt']) && expiresSoon();
+        // pub / toAct: the host answers a player's move inside their own turn here (online.js v2)
+        allow create, update: if isHost() && d().keys().hasOnly(['json', 'v', 'pub', 'toAct', 'expireAt']) && expiresSoon();
         allow delete: if isHost();
       }
 
