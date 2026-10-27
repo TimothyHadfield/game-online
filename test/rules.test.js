@@ -105,6 +105,12 @@ const move = (by, seat, extra = {}) => Object.assign({ by, seat, a: { card: 5 },
   await seed({}, Timestamp.fromMillis(Date.now() - 120e3));
   await check("stale host: carol (not a member) still CANNOT take it", assertFails(updateDoc(doc(as("carol"), R), { hostUid: "carol" })));
   await check("stale host: bob CANNOT take it AND change other fields", assertFails(updateDoc(doc(as("bob"), R), { hostUid: "bob", toAct: [0] })));
+  // 2026-10-27: the host beats every 15 s, so 40 s of silence = gone (was 75 s).
+  await seed({}, Timestamp.fromMillis(Date.now() - 45e3));
+  await check("bob TAKES the host when alice's heartbeat is 45 s old", assertSucceeds(updateDoc(doc(as("bob"), R), { hostUid: "bob" })));
+  await seed({}, Timestamp.fromMillis(Date.now() - 25e3));
+  await check("bob CANNOT take the host after a 25 s blip (one missed beat)", assertFails(updateDoc(doc(as("bob"), R), { hostUid: "bob" })));
+  await seed();
   await check("bob CANNOT delete the room", assertFails(deleteDoc(doc(as("bob"), R))));
 
   console.log("Creating rooms");

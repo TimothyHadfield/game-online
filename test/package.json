@@ -4,7 +4,7 @@
   "type": "commonjs",
   "description": "Dev-only tests. The sites themselves have no dependencies.",
   "scripts": {
-    "test": "node local.test.mjs && firebase emulators:exec --only firestore,auth --project demo-boardgames \"node rules.test.js && node online.test.mjs\""
+    "test": "node local.test.mjs && firebase emulators:exec --only firestore,auth --project demo-boardgames \"node rules.test.js && node online.test.mjs 10 && node online.test.mjs 11 && node online.test.mjs 12 && node online.test.mjs old\""
   },
   "dependencies": {
     "@firebase/rules-unit-testing": "^5.0.1",

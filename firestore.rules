@@ -55,10 +55,10 @@ service cloud.firestore {
             && expiresSoon();
       }
 
-      // Host's heartbeat older than 75 s (or missing) = the host is gone.
+      // Host's heartbeat older than 40 s (or missing) = the host is gone (it beats every 15 s).
       function hostStale() {
         let p = /databases/$(database)/documents/games/$(gameId)/rooms/$(code)/presence/$(resource.data.hostUid);
-        return !exists(p) || get(p).data.at < request.time - duration.value(75, 's');
+        return !exists(p) || get(p).data.at < request.time - duration.value(40, 's');
       }
 
       allow get:  if signedIn();

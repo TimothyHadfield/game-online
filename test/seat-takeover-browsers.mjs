@@ -1,7 +1,7 @@
 // Three separate headless browsers against the REAL project: someone typing an away
 // player's name must NOT get their seat unless the host taps Allow on the built-in card.
 //   node test/seat-takeover-browsers.mjs [url] [--engine chromium|webkit] [--shots dir]
-// Takes ~2 minutes (a player only counts as away after 75 s without a heartbeat).
+// Takes ~3 minutes (a player only counts as away after 130 s without a heartbeat).
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -41,8 +41,9 @@ await bB.close();
 
 const bobAway = () => A.waitForFunction(() => {
   const row = [...document.querySelectorAll("#table .seat")].find((r) => /Bob/.test(r.textContent));
-  return row && !row.querySelector(".dot.on");
-}, null, { timeout: 120000, polling: 1000 });
+  // away = dot off, or (since 2026-10-27) a computer already playing the seat for him
+  return row && (!row.querySelector(".dot.on") || /computer/i.test(row.textContent));
+}, null, { timeout: 240000, polling: 1000 });
 await bobAway();
 console.log("PASS host sees Bob offline");
 

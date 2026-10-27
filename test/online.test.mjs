@@ -2,7 +2,9 @@
 // Run inside `firebase emulators:exec --only firestore,auth` (see package.json).
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { createOnline } from "../online.js";
+import { pathToFileURL } from "node:url";
+// ONLINE_JS=<path> runs the suite against another copy (to prove a new test fails on old code).
+const { createOnline } = await import(process.env.ONLINE_JS ? pathToFileURL(process.env.ONLINE_JS).href : "../online.js");
 import { highCard } from "../demo/high-card.js";
 const require = createRequire(import.meta.url);
 const appMod = require("firebase/app");
@@ -52,6 +54,96 @@ const env = await initializeTestEnvironment({
   firestore: { rules: fsRead.readFileSync(new URL("../firestore.rules", import.meta.url), "utf8"), host: EMU.host, port: EMU.firestorePort },
 });
 await env.clearFirestore();
+
+// ONLY=10,12 runs just those sections and stops (the 2026-10-27 AFK / reclaim / host-drop checks run first).
+// `node online.test.mjs 10` / `11,12` / `new` / `old` runs a part. npm test runs the parts as separate processes:
+// with many clients in one process the emulator's Listen streams get corrupted (see progress.md Traps).
+const PART = process.argv[2] || "all";
+const only = /^[\d,]+$/.test(PART) ? PART.split(",") : process.env.ONLY ? process.env.ONLY.split(",") : null;
+const want = (n) => PART !== "old" && (!only || only.includes(String(n)));
+const backdate = (R, uid, ageMs) => env.withSecurityRulesDisabled(async (ctx) => {
+  await fsMod.setDoc(fsMod.doc(ctx.firestore(), R + "/presence/" + uid), { at: fsMod.Timestamp.fromMillis(Date.now() - ageMs), expireAt: fsMod.Timestamp.fromMillis(Date.now() + 864e5) });
+});
+async function twoSeats(tag, options = {}) {
+  const H = client(tag + "-host"), G = client(tag + "-guest");
+  const m = await H.o.createRoom({ name: "Hana", seats: ["human", "empty"], options: Object.assign({ handSize: 3 }, options) });
+  const jr = await G.o.joinRoom(m.code, "Gus");
+  assert.equal(jr.ok, true, tag + ": join: " + jr.message);
+  await until(() => H.snap.seats[1].kind === "human", tag + ": gus seated");
+  await H.o.start();
+  await until(() => G.snap && G.snap.status === "playing" && G.snap.mine, tag + ": gus playing");
+  return { H, G, code: m.code, R: "games/high-card/rooms/" + m.code };
+}
+
+// 10. AFK (Clocktower, Clue): an away player's turn waits the room's timeout,
+// then a computer plays the seat; the same phone gets it back when it returns.
+if (want(10)) {
+  const { H, G, code, R } = await twoSeats("afk", { turnTimeoutSec: 2, handSize: 6 });
+  await H.o.act({ card: H.snap.mine.hand[0] });          // only gus is waited on now
+  const gUid = G.o.uid;
+  await G.o._detach();                                     // phone locked / tab closed
+  const t0 = Date.now();
+  await backdate(R, gUid, 200e3);                          // …long enough ago to count as away
+  await until(() => H.snap.seats[1].kind === "computer", "a computer takes away gus's seat", 20000);
+  assert.equal(H.snap.seats[1].auto, true, "seat is marked as played FOR gus");
+  await until(() => H.snap.pub.round === 1, "the computer plays gus's card");
+  ok(`away player: computer took the seat after ${((Date.now() - t0) / 1000).toFixed(1)} s (room timeout 2 s) and played`);
+  const back = await G.o.joinRoom(code, "Gus");             // same phone opens the game again
+  assert.equal(back.ok, true, back.message);
+  assert.equal(back.seat, 1);
+  await until(() => H.snap.seats[1].kind === "human" && H.snap.seats[1].name === "Gus" && !H.snap.seats[1].auto, "gus has his seat back", 15000);
+  // (the computer may have played one more card for him in the meantime)
+  await until(() => G.snap && G.snap.mine && G.snap.mine.hand.length > 0 && G.snap.mine.hand.length === G.snap.pub.handCounts[1] && !G.snap.autoPlay, "gus sees his hand again");
+  ok("gus's phone comes back → seat 1 is his again, with his hand");
+  // a player who is HERE is never hurried
+  await until(() => H.snap.myTurn || G.snap.myTurn, "someone to move");
+  if (H.snap.myTurn) await H.o.act({ card: H.snap.mine.hand[0] });
+  await until(() => G.snap.myTurn, "gus to move");
+  await wait(4000);
+  assert.equal(H.snap.seats[1].kind, "human", "an online player was replaced");
+  ok("an online player who takes his time keeps his seat");
+  await H.o.close(); await G.o._detach();   // free the emulator streams
+}
+
+// 11. The host hands an away player's seat to a computer (Clue): their phone can take it back.
+if (want(11)) {
+  const { H, G, code } = await twoSeats("give");
+  await G.o._detach();
+  assert.equal((await H.o.setSeat(1, "computer")).ok, true);
+  await until(() => H.snap.seats[1].kind === "computer", "host gives gus's seat to a computer");
+  const back = await G.o.joinRoom(code, "Gus");
+  assert.equal(back.ok, true, "phone could not reclaim its seat: " + back.message);
+  await until(() => H.snap.seats[1].kind === "human" && H.snap.seats[1].name === "Gus", "seat handed back", 15000);
+  ok("seat given to a computer → gus's phone reclaims it");
+  await H.o.close(); await G.o._detach();   // free the emulator streams
+}
+
+// 12. Host drops without warning (Stratego): how long until the guest takes over? Was ~75–85 s.
+if (want(12)) {
+  const { H, G, R } = await twoSeats("drop");
+  // A brief blip (one missed host beat) must NOT hand hosting away.
+  await H.o._detach();
+  await backdate(R, H.o.uid, 20e3);
+  await wait(8000);
+  assert.equal(G.snap.isHost, false, "guest took over after a 28 s blip");
+  ok("28 s without a host beat: no takeover (a blip)");
+  // Real drop: fresh beat, then silence.
+  await backdate(R, H.o.uid, 0);
+  const t0 = Date.now();
+  await until(() => G.snap.isHost, "guest takes over", 70000);
+  const secs = (Date.now() - t0) / 1000;
+  assert.ok(secs < 50, "took " + secs + " s");
+  ok(`host silent → guest is host after ${secs.toFixed(1)} s`);
+  await until(() => G.snap.myTurn, "guest can play on");
+  // right away, while the new host may still be loading the table
+  const mv = await G.o.act({ card: G.snap.mine.hand[0] });
+  assert.equal(mv.ok, true, "new host's first move: " + mv.message);
+  ok("the new host's first move goes through");
+  await G.o.close();
+}
+
+if (only || PART === "new") { console.log(`\nonline (new checks): ${pass} passed`); await env.cleanup(); process.exit(0); }
+
 
 const A = client("alice"), B = client("bob"), C = client("carol");
 
@@ -205,7 +297,7 @@ ok("host close() deletes the room and every sub-document");
   const goAway = async (c, uid) => {
     await c.o._detach();
     await env.withSecurityRulesDisabled(async (ctx) => {
-      await fsMod.setDoc(fsMod.doc(ctx.firestore(), R + "/presence/" + uid), { at: fsMod.Timestamp.fromMillis(Date.now() - 120e3), expireAt: fsMod.Timestamp.fromMillis(Date.now() + 864e5) });
+      await fsMod.setDoc(fsMod.doc(ctx.firestore(), R + "/presence/" + uid), { at: fsMod.Timestamp.fromMillis(Date.now() - 200e3), expireAt: fsMod.Timestamp.fromMillis(Date.now() + 864e5) });
     });
     await until(() => H.snap.seats[1].online === false, "host sees alice offline");
   };

@@ -1,7 +1,9 @@
 // Local rooms (no network): createLocal + the High Card demo game.
 import assert from "node:assert/strict";
-import { createLocal } from "../online.js";
+import { pathToFileURL } from "node:url";
 import { highCard } from "../demo/high-card.js";
+// ONLINE_JS=<path> runs the suite against another copy (to prove a new test fails on old code).
+const { createLocal, createOnline } = await import(process.env.ONLINE_JS ? pathToFileURL(process.env.ONLINE_JS).href : "../online.js");
 
 let pass = 0;
 const ok = (label) => { pass++; console.log("  PASS  " + label); };
@@ -88,6 +90,22 @@ ok("2,000 bot-only games end with one point per round, no duplicate cards");
   assert.deepEqual(room.view(0).seats.map((s) => s.online), [true, false, true]);
   room.close();
   ok("local snapshot: empty seat offline, human and computer online");
+}
+
+// 7. Online can't load (no internet: the Firebase SDK download fails) → a plain
+// message, not the browser's "Importing a module script failed." (Coup, Evolution).
+// In node the CDN import fails the same way a phone with no signal does.
+{
+  const o = createOnline({ game: highCard });
+  const errs = [];
+  o.on("error", (m) => errs.push(m));
+  const r = await o.createRoom({ name: "Tim" });
+  assert.equal(r.ok, false);
+  assert.equal(r.message, "Online play couldn't load. Check your internet and try again.");
+  assert.deepEqual(errs, [r.message]);
+  const j = await o.joinRoom("ABCDE", "Tim");
+  assert.equal(j.message, r.message, "join says the same");
+  ok("no internet: \"" + r.message + "\"");
 }
 
 console.log(`\nlocal: ${pass} passed`);
