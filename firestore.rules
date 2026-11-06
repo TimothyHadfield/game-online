@@ -23,6 +23,8 @@ rules_version = '2';
 //      TTL policies need a billing account and this project stays on Spark.
 //   6. Host takeover only when the host's heartbeat AND its last room write
 //      are both over 40 s old.
+//   7. games/{gameId}/users/{uid}/sets/*: only that signed-in (non-anonymous)
+//      account reads or writes its saved sets (Mystery Face custom people).
 // ============================================================================
 
 service cloud.firestore {
@@ -148,6 +150,20 @@ service cloud.firestore {
                       && expiresSoon();
         allow delete: if signedIn() && (jUid == uid() || isHost());
       }
+    }
+
+    // ---- 7. a player's saved sets (Mystery Face custom people, 2026-11-06) ----
+    // Only that account reads or writes them; anonymous logins (online play without an account)
+    // can't save. Firestore caps each doc at 1 MiB; the game keeps photos ~10 KB each.
+    match /games/{gameId}/users/{u}/sets/{setId} {
+      function owner() { return signedIn() && u == uid() && gameId.matches('^[a-z0-9-]{1,32}$'); }
+      allow read, delete: if owner();
+      allow create, update: if owner()
+                    && request.auth.token.firebase.sign_in_provider != 'anonymous'
+                    && setId.matches('^[A-Za-z0-9_-]{1,40}$')
+                    && d().keys().hasOnly(['title', 'people', 'updatedAt'])
+                    && d().title is string && d().title.size() <= 40
+                    && d().people is list && d().people.size() <= 40;
     }
 
     // ---- 5. self-cleaning (TTL policies need billing, so the clients sweep) ----

@@ -182,7 +182,30 @@ const move = (by, seat, extra = {}) => Object.assign({ by, seat, a: { card: 5 },
   await check("carol CANNOT delete a live room", assertFails(deleteDoc(doc(as("carol"), R))));
   await check("carol CANNOT delete a live hand", assertFails(deleteDoc(doc(as("carol"), R + "/hands/bob"))));
 
+  console.log("Saved sets on a player's account (Mystery Face custom people)");
+  await env.clearFirestore();
+  const acct = (u) => env.authenticatedContext(u, { firebase: { sign_in_provider: "password" } }).firestore();
+  const anonAcct = (u) => env.authenticatedContext(u, { firebase: { sign_in_provider: "anonymous" } }).firestore();
+  const S = (u, id = "s1") => `games/mystery-face/users/${u}/sets/${id}`;
+  const SET = (n = 3) => ({ title: "Family", people: Array.from({ length: n }, (_, i) => ({ id: "p" + i, name: i ? "P" + i : "", img: null })), updatedAt: Date.now() });
+  await check("dana saves a set on her own account", assertSucceeds(setDoc(doc(acct("dana"), S("dana")), SET())));
+  await check("dana reads her set", assertSucceeds(getDoc(doc(acct("dana"), S("dana")))));
+  await check("dana lists her sets", assertSucceeds(getDocs(collection(acct("dana"), `games/mystery-face/users/dana/sets`))));
+  await check("dana updates her set", assertSucceeds(setDoc(doc(acct("dana"), S("dana")), SET(5))));
+  await check("eve CANNOT read dana's set", assertFails(getDoc(doc(acct("eve"), S("dana")))));
+  await check("eve CANNOT list dana's sets", assertFails(getDocs(collection(acct("eve"), `games/mystery-face/users/dana/sets`))));
+  await check("eve CANNOT write into dana's account", assertFails(setDoc(doc(acct("eve"), S("dana", "s2")), SET())));
+  await check("eve CANNOT delete dana's set", assertFails(deleteDoc(doc(acct("eve"), S("dana")))));
+  await check("signed-out user reads no set", assertFails(getDoc(doc(anon(), S("dana")))));
+  await check("an anonymous login (no account) CANNOT save sets", assertFails(setDoc(doc(anonAcct("fay"), S("fay")), SET())));
+  await check("set with extra fields refused", assertFails(setDoc(doc(acct("dana"), S("dana", "s3")), Object.assign(SET(), { x: 1 }))));
+  await check("set with over 40 people refused", assertFails(setDoc(doc(acct("dana"), S("dana", "s4")), SET(41))));
+  await check("set with a 41-letter title refused", assertFails(setDoc(doc(acct("dana"), S("dana", "s5")), Object.assign(SET(), { title: "x".repeat(41) }))));
+  await check("set id with odd characters refused", assertFails(setDoc(doc(acct("dana"), S("dana", "a.b")), SET())));
+  await check("sets only under a valid game id", assertFails(setDoc(doc(acct("dana"), "games/BAD!/users/dana/sets/s1"), SET())));
+  await check("dana deletes her set", assertSucceeds(deleteDoc(doc(acct("dana"), S("dana")))));
+
   await env.cleanup();
-  console.log(`\nrules: ${pass} passed, ${fail} failed`);
+  console.log(`\nrules:${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();
