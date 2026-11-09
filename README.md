@@ -187,13 +187,6 @@ Keep games under it:
 
 ## Changelog
 
-- **2026-11-06 — saved sets on accounts (Mystery Face).** New rule block 7:
-  `games/{gameId}/users/{uid}/sets/{setId}` = `{ title (≤40), people (≤40), updatedAt }`, read/write by that
-  uid only, never by an anonymous login. 16 new emulator checks (5 failed on the old rules), 105/105 pass;
-  deployed to th-board-games. Auth providers on the project now: anonymous, email/password and Google
-  (Google was enabled from a scratch config so the support email stays out of this public repo;
-  `timothyhadfield.github.io` was already an authorized domain). online.js is unchanged; no game needs to re-copy.
-
 - **2026-10-27 — cache stamp.** Games load `online.js?v=<stamp>` (`node tools/stamp.mjs`; v2 is
   `a3d0418b`). After every re-copy, update the stamp in each game and run `--check` (see §1 step 4).
 
